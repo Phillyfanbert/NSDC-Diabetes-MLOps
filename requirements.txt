@@ -1,5 +1,4 @@
 pandas
 requests
-pyarrow
 fastparquet
-scikit-learn
+numpy<2
