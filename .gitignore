@@ -12,3 +12,4 @@ venv/
 # Ignore MLflow local logs
 mlruns/
 outputs/
+.DS_Store
