@@ -1,0 +1,14 @@
+# Ignore data files (MLOps best practice: don't push raw data to Git)
+data/
+*.parquet
+*.csv
+
+# Ignore Python environment and cache
+__pycache__/
+venv/
+.env
+.ipynb_checkpoints/
+
+# Ignore MLflow local logs
+mlruns/
+outputs/
