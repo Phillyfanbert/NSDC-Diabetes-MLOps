@@ -1,0 +1,13 @@
+KIR (Kiribati), FSM (Micronesia), TUV (Tuvalu), COK (Cook Islands) — all Pacific Island nations, which is well-documented. These small island countries have seen dramatic dietary shifts (processed/imported food replacing traditional diets) with limited healthcare infrastructure.
+LCA (St. Lucia), IRQ (Iraq), EGY (Egypt) — Middle East & Caribbean also rising fast, driven by urbanization and sedentary lifestyles.
+
+
+Week 4 - Progress 
+__________________
+
+
+I added lag columns from 1y, 2years ago
+Scaled values so that the mean is normally distributed(0) with a standard deviation around 1
+
+New feature like obesity 1,2,3 years ago columns is more telling for our model's predictions.
+Since diabetes develops over years, so now the model understands trends over time and causation rather than correlation between variables. 
