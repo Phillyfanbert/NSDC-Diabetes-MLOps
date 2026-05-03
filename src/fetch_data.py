@@ -69,7 +69,7 @@ def run_ingestion_pipeline():
 
         # 3. Versioning/Storage
         # We save as Parquet to preserve the 46 columns' data types
-        master_df.to_parquet(RAW_DATA_PATH, index=False, engine='fastparquet')
+        master_df.to_parquet(RAW_DATA_PATH, index=False, engine='pyarrow')
         
         print("\n" + "="*30)
         print(f"✅ PIPELINE SUCCESSFUL")
