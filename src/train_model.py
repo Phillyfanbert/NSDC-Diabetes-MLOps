@@ -13,11 +13,12 @@ def train_baseline():
     with mlflow.start_run(run_name="Linear_Regression_Baseline") as run:
         # --- 2. Load the Final Processed Data ---
         # (This is the file produced by Member 5: The Architect)
-        data_path = 'data/processed/diabetes_final.parquet'
+        data_path = 'data/processed/features.parquet'
         df = pd.read_parquet(data_path)
+        df = df.dropna()
 
         # Define Features and Target
-        X = df[['feature_obesity', 'year']]
+        X = df[['feature_obesity_scaled', 'obesity_lag_1y_scaled', 'obesity_lag_2y_scaled', 'obesity_lag_3y_scaled']]
         y = df['target_diabetes']
 
         # --- 3. Train the Model ---

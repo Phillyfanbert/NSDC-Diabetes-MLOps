@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-RAW_DATA_PATH      = Path("data/raw/diabetes_obesity_raw.parquet")
+RAW_DATA_PATH      = Path("data/clean/diabetes_obesity_clean.parquet")
 FEATURES_DATA_PATH = Path("data/processed/features.parquet")
 
 # years to lag obesity by — diabetes develops over time so we want past values
