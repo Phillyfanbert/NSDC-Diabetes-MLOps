@@ -72,7 +72,7 @@ def run_ingestion_pipeline():
         master_df.to_parquet(RAW_DATA_PATH, index=False, engine='pyarrow')
         
         print("\n" + "="*30)
-        print(f"✅ PIPELINE SUCCESSFUL")
+        print(f"✅ DATA FETCHING SUCCESSFUL")
         print(f"Saved to: {RAW_DATA_PATH}")
         print(f"Observations: {len(master_df)}")
         print(f"Total Columns: {len(master_df.columns)}")
