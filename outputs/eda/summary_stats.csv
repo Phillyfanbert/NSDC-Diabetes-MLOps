@@ -1,0 +1,3 @@
+,count,mean,median,std,min,max,q1,q3
+target_diabetes,5025.0,7.901,6.9,3.902,1.9,29.8,5.6,8.8
+feature_obesity,5075.0,14.902,13.728,11.513,0.208,67.834,5.877,19.994
