@@ -1,0 +1,58 @@
+Prisha Week 4 EDA Summary
+Dataset: WHO diabetes-obesity merged dataset
+Observations: 5075
+Columns: 46
+
+Main variables used:
+- target_diabetes: diabetes prevalence (%)
+- feature_obesity: obesity prevalence (%)
+- year: observation year
+- ParentLocation: WHO region
+- country_code: ISO 3-letter country code
+
+Abbreviation notes (ISO-3 country codes):
+- NRU = Nauru
+- COK = Cook Islands
+- NIU = Niue
+- WSM = Samoa
+- TON = Tonga
+- TUV = Tuvalu
+- PLW = Palau
+- KIR = Kiribati
+- FSM = Federated States of Micronesia
+- MHL = Marshall Islands
+- BHS = Bahamas
+
+Summary statistics interpretation:
+- Mean = arithmetic average
+- Median = middle value after sorting
+- Std = standard deviation, showing spread/variability
+- Min = smallest value
+- Max = largest value
+- q1 = 25th percentile
+- q3 = 75th percentile
+
+Key findings:
+1. Diabetes prevalence has a mean of about 7.901 and a median of 6.900, suggesting a right-skewed distribution with some higher-prevalence country-year observations.
+2. Obesity prevalence has a mean of about 14.902 and a median of 13.728, also showing meaningful spread across countries and years.
+3. Global average obesity and diabetes both increase over time, which supports the project’s modeling idea of using historical obesity trends to predict diabetes prevalence.
+4. Regional trend differences suggest that geography and hidden confounding factors may matter in addition to obesity alone.
+5. The obesity vs diabetes scatterplot shows a positive relationship overall, but with visible dispersion, meaning obesity is important but not the only driver of diabetes prevalence.
+
+Latest-year interpretation:
+- The top 10 diabetes and obesity tables show the highest-prevalence country-year observations in the latest available year in the dataset (2014).
+- Many of the highest-obesity and highest-diabetes entries come from Pacific Island countries, which suggests a strong regional pattern worth mentioning in the final presentation.
+
+Files produced:
+- summary_stats.csv
+- histograms_diabetes_obesity.png
+- boxplots_diabetes_obesity.png
+- global_trends_combined.png
+- global_trends_separate.png
+- regional_diabetes_trends.png
+- regional_obesity_trends.png
+- obesity_vs_diabetes_scatter.png
+- latest_year_obesity_vs_diabetes.png
+- top10_diabetes_latest_year.csv
+- top10_obesity_latest_year.csv
+- prisha_eda_summary.txt
