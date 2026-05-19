@@ -6,3 +6,6 @@ __pycache__/
 mlruns/
 logs/
 diabetes_mlops/
+*.png
+*.csv
+dashboard.html

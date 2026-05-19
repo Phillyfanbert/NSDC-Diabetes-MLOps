@@ -1,75 +1,173 @@
+from __future__ import annotations
+import sys
 import pandas as pd
 from pathlib import Path
 
-# using file from fetch_data.py
-# change path to cleaning.py file later
-DATA_PATH = Path("data/raw/diabetes_obesity_raw.parquet")
+import mlflow
 
-MIN_YEAR = 1975
-MAX_YEAR = 2024
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DATA_PATH       = Path("data/clean/diabetes_obesity_clean.parquet")   # reads CLEAN, not raw
+MIN_YEAR        = 1975
+MAX_YEAR        = 2024
+MLFLOW_TRACKING = "http://127.0.0.1:5000"
+EXPERIMENT_NAME = "NSDC_Diabetes_Project"
 
-def load_data(path):
+REQUIRED_COLS   = ["country_code", "year", "target_diabetes", "feature_obesity"]
+PERCENT_COLS    = ["target_diabetes", "feature_obesity"]
+
+
+# ---------------------------------------------------------------------------
+# Load
+# ---------------------------------------------------------------------------
+def load_data(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
-            f"Could not find {path}, run fetch_data.py first or change DATA_PATH"
+            f"Could not find {path}. Run fetch_data.py then cleaning.py first."
         )
-
-    if path.suffix == ".csv":
-        return pd.read_csv(path)
-
     if path.suffix == ".parquet":
         return pd.read_parquet(path)
+    if path.suffix == ".csv":
+        return pd.read_csv(path)
+    raise ValueError(f"Unsupported file type: {path.suffix}. Use .parquet or .csv.")
 
-    raise ValueError("DATA_PATH must be a .csv or .parquet file")
+
+# ---------------------------------------------------------------------------
+# Individual checks — each returns (passed: bool, detail: str)
+# ---------------------------------------------------------------------------
+def check_required_columns(df: pd.DataFrame) -> tuple[bool, str]:
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        return False, f"Missing required columns: {missing}"
+    return True, f"All required columns present: {REQUIRED_COLS}"
 
 
-def validate_data(df):
-    print(f"Rows: {len(df)}")
-    print(f"Columns: {len(df.columns)}")
+def check_missing_values(df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Reports missing values per required column.
+    Does NOT drop rows — missing data is flagged for human review,
+    which is the correct MLOps behaviour at the validation stage.
+    """
+    counts = df[REQUIRED_COLS].isnull().sum()
+    missing = counts[counts > 0]
+    if missing.empty:
+        return True, "No missing values in required columns"
+    lines = [f"  {col}: {n} missing ({n / len(df) * 100:.1f}%)" for col, n in missing.items()]
+    return False, "Missing values found (rows kept for human review):\n" + "\n".join(lines)
 
-    # check columns needed
-    needed_cols = ["country_code", "year", "target_diabetes", "feature_obesity"]
 
-    for col in needed_cols:
-        assert col in df.columns, f"Missing column: {col}"
+def check_percentage_ranges(df: pd.DataFrame) -> tuple[bool, str]:
+    violations = {}
+    for col in PERCENT_COLS:
+        bad = df[(df[col] < 0) | (df[col] > 100)]
+        if not bad.empty:
+            violations[col] = len(bad)
+    if violations:
+        lines = [f"  {col}: {n} out-of-range values" for col, n in violations.items()]
+        return False, "Out-of-range percentages:\n" + "\n".join(lines)
+    return True, f"All percentage columns within [0, 100]: {PERCENT_COLS}"
 
-    print("Required columns exist")
 
-    # check for missing values
-    missing = df[needed_cols].isnull().sum()
-    missing = missing[missing > 0]
+def check_year_range(df: pd.DataFrame) -> tuple[bool, str]:
+    bad = df[(df["year"] < MIN_YEAR) | (df["year"] > MAX_YEAR)]
+    if not bad.empty:
+        bad_vals = sorted(bad["year"].unique().tolist())
+        return False, f"{len(bad)} rows have years outside [{MIN_YEAR}, {MAX_YEAR}]: {bad_vals[:10]}"
+    year_min, year_max = int(df["year"].min()), int(df["year"].max())
+    return True, f"Year range valid: {year_min} – {year_max}"
 
-    if len(missing) == 0:
-        print("No missing values in important columns")
-    else:
-        print("Missing values found:")
-        print(missing)
-        print("Report missing values for now, do not automatically drop")
 
-    # check all percentages are between 0 and 100
-    percent_cols = ["target_diabetes", "feature_obesity"]
+def check_duplicates(df: pd.DataFrame) -> tuple[bool, str]:
+    dupes = df[df.duplicated(subset=["country_code", "year"], keep=False)]
+    if not dupes.empty:
+        examples = dupes[["country_code", "year"]].drop_duplicates().head(5).values.tolist()
+        return False, f"{len(dupes)} duplicate (country_code, year) rows found. Examples: {examples}"
+    return True, f"All (country_code, year) pairs are unique: {df['country_code'].nunique()} countries"
 
-    for col in percent_cols:
-        bad_values = df[(df[col] < 0) | (df[col] > 100)]
-        assert len(bad_values) == 0, f"{col} has values outside 0-100"
 
-    print("Percentage columns are between 0 and 100")
+# ---------------------------------------------------------------------------
+# Main validation runner
+# ---------------------------------------------------------------------------
+def validate_data(df: pd.DataFrame) -> bool:
+    """
+    Run all checks and return True only if every hard check passes.
+    Missing-value check is a soft warning — it logs but does not fail the run,
+    because WHO data commonly has sparse coverage for some countries/years.
+    """
+    checks = [
+        ("required_columns",   check_required_columns,   True),   # hard
+        ("missing_values",     check_missing_values,      False),  # soft (warn only)
+        ("percentage_ranges",  check_percentage_ranges,   True),   # hard
+        ("year_range",         check_year_range,          True),   # hard
+        ("no_duplicates",      check_duplicates,          True),   # hard
+    ]
 
-    # check year column within expected range (1975 - 2024)
-    bad_years = df[(df["year"] < MIN_YEAR) | (df["year"] > MAX_YEAR)]
-    assert len(bad_years) == 0, f"Some years are outside {MIN_YEAR}-{MAX_YEAR}"
+    results  = {}
+    all_pass = True
 
-    print(f"Years are between {MIN_YEAR} and {MAX_YEAR}")
+    print(f"\nValidating: {DATA_PATH}")
+    print(f"Shape: {df.shape[0]:,} rows × {df.shape[1]} columns\n")
 
-    # check combination of country_code + year is unique
-    duplicates = df[df.duplicated(subset=["country_code", "year"], keep=False)]
-    assert len(duplicates) == 0, "Duplicate country_code + year rows found"
+    for name, fn, is_hard in checks:
+        passed, detail = fn(df)
+        results[name] = {"passed": passed, "detail": detail, "hard": is_hard}
 
-    print("All combinations of country_code + year are unique")
+        icon = "✅" if passed else ("❌" if is_hard else "⚠️ ")
+        print(f"{icon} [{name}]")
+        print(f"   {detail}\n")
 
-    print("Validation passed")
+        if not passed and is_hard:
+            all_pass = False
+
+    return all_pass, results
+
+
+# ---------------------------------------------------------------------------
+# Pipeline entry point — logs everything to MLflow
+# ---------------------------------------------------------------------------
+def run_validation_pipeline() -> None:
+    mlflow.set_tracking_uri(MLFLOW_TRACKING)
+    mlflow.set_experiment(EXPERIMENT_NAME)
+
+    df = load_data(DATA_PATH)
+
+    with mlflow.start_run(run_name="data_validation") as run:
+
+        mlflow.log_param("data_path",  str(DATA_PATH))
+        mlflow.log_param("min_year",   MIN_YEAR)
+        mlflow.log_param("max_year",   MAX_YEAR)
+        mlflow.log_metric("rows",      df.shape[0])
+        mlflow.log_metric("columns",   df.shape[1])
+
+        all_pass, results = validate_data(df)
+
+        # Log each check result as a metric (1 = pass, 0 = fail)
+        for name, r in results.items():
+            mlflow.log_metric(f"check_{name}", int(r["passed"]))
+
+        # Log missing-value counts per column as metrics for trend monitoring
+        for col in REQUIRED_COLS:
+            n_missing = int(df[col].isnull().sum())
+            mlflow.log_metric(f"missing_{col}", n_missing)
+
+        mlflow.set_tag("stage",  "data_validation")
+        mlflow.set_tag("status", "PASSED" if all_pass else "FAILED")
+
+        print("=" * 40)
+        if all_pass:
+            print("✅ VALIDATION PASSED — pipeline may continue")
+            print(f"   MLflow run: {run.info.run_id}")
+        else:
+            print("❌ VALIDATION FAILED — pipeline halted")
+            print(f"   MLflow run: {run.info.run_id}")
+            print("   Fix the issues above before re-running.")
+        print("=" * 40)
+
+        # Hard exit with non-zero code so run_pipeline.sh stops on failure
+        if not all_pass:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    df = load_data(DATA_PATH)
-    validate_data(df)
+    run_validation_pipeline()

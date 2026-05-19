@@ -1,45 +1,85 @@
-import pandas as pd
+from __future__ import annotations
+import json
 import numpy as np
+import pandas as pd
 from pathlib import Path
 
-RAW_DATA_PATH      = Path("data/clean/diabetes_obesity_clean.parquet")
-FEATURES_DATA_PATH = Path("data/processed/features.parquet")
+import mlflow
 
-# years to lag obesity by — diabetes develops over time so we want past values
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CLEAN_DATA_PATH    = Path("data/clean/diabetes_obesity_clean.parquet")
+FEATURES_DATA_PATH = Path("data/processed/features.parquet")
+SCALE_PARAMS_PATH  = Path("data/processed/scale_params.json")   # ← NEW: persisted scalers
+MLFLOW_TRACKING    = "http://127.0.0.1:5000"
+EXPERIMENT_NAME    = "NSDC_Diabetes_Project"
+
+# Lag windows — changing this list is the only thing needed to try new windows
 LAG_YEARS = [1, 2, 3]
 
+CORE_COLS = ["country_code", "year", "target_diabetes", "feature_obesity"]
 
-def load_raw(path: Path) -> pd.DataFrame:
+
+# ---------------------------------------------------------------------------
+# Step 1 — Load
+# ---------------------------------------------------------------------------
+def load_clean(path: Path) -> pd.DataFrame:
     if not path.exists():
-        raise FileNotFoundError(f"Raw data not found at '{path}'. Run fetch_data.py first.")
-    df = pd.read_parquet(path, engine="fastparquet")
-    print(f"Loaded: {df.shape[0]:,} rows x {df.shape[1]} cols")
+        raise FileNotFoundError(
+            f"Clean data not found at '{path}'. "
+            "Run fetch_data.py → cleaning.py first."
+        )
+    df = pd.read_parquet(path, engine="pyarrow")
+    print(f"Loaded: {df.shape[0]:,} rows × {df.shape[1]} cols from {path}")
     return df
 
 
+# ---------------------------------------------------------------------------
+# Step 2 — Select core columns
+# ---------------------------------------------------------------------------
 def select_core(df: pd.DataFrame) -> pd.DataFrame:
-    # drop everything except the 4 columns we actually need
-    core = df[["country_code", "year", "target_diabetes", "feature_obesity"]].copy()
+    """Keep only the four columns the feature pipeline needs."""
+    missing = [c for c in CORE_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Clean data is missing expected columns: {missing}")
+    core = df[CORE_COLS].copy()
     core["year"] = core["year"].astype(int)
     core = core.sort_values(["country_code", "year"]).reset_index(drop=True)
     return core
 
 
+# ---------------------------------------------------------------------------
+# Step 3 — Temporal lags
+# ---------------------------------------------------------------------------
 def add_temporal_lags(df: pd.DataFrame, lags: list[int]) -> pd.DataFrame:
-    # for each lag, pull obesity value from N years ago for that country
-    # this lets the model learn that obesity now -> diabetes later
+    """
+    For each lag N, pull each country's obesity value from N years prior.
+    Rows without enough history get NaN — they are dropped before training.
+    """
     df = df.copy()
     for lag in lags:
         col = f"obesity_lag_{lag}y"
         df[col] = df.groupby("country_code")["feature_obesity"].shift(lag)
-        print(f"  lag {lag}y: {df[col].notna().sum():,} non-null values")
+        n_valid = int(df[col].notna().sum())
+        n_null  = int(df[col].isna().sum())
+        print(f"  lag {lag}y → {n_valid:,} valid, {n_null:,} NaN (insufficient history)")
     return df
 
 
+# ---------------------------------------------------------------------------
+# Step 4 — Standard scaling  ← KEY FIX: params are now saved to disk
+# ---------------------------------------------------------------------------
 def standard_scale(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    # z-score each feature: subtract mean, divide by std -> roughly N(0,1)
-    # save the params so we can apply the same transform at inference time
-    feature_cols = (
+    """
+    Z-score scale every feature and target column.
+
+    Scale params (mean + std) are computed on the FULL dataset here and
+    returned for persistence to disk. serve_model.py must load these same
+    params at inference time — this eliminates the hardcoded approximations
+    that were previously baked into the API.
+    """
+    scale_cols = (
         ["feature_obesity", "target_diabetes"]
         + [c for c in df.columns if c.startswith("obesity_lag_")]
     )
@@ -47,106 +87,164 @@ def standard_scale(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     params = {}
     df = df.copy()
 
-    for col in feature_cols:
+    for col in scale_cols:
         mu  = df[col].mean()
         std = df[col].std(ddof=0)
+
         if std == 0 or np.isnan(std):
-            print(f"  skipping '{col}' (zero variance)")
+            print(f"  ⚠️  Skipping '{col}' — zero variance, cannot scale")
             continue
+
         df[f"{col}_scaled"] = (df[col] - mu) / std
-        params[col] = {"mean": round(mu, 6), "std": round(std, 6)}
+        params[col] = {"mean": round(float(mu), 6), "std": round(float(std), 6)}
+        print(f"  {col}: mean={params[col]['mean']}, std={params[col]['std']}")
 
     return df, params
 
 
-def run_eda(df: pd.DataFrame) -> None:
-    print("\n--- EDA ---")
+def save_scale_params(params: dict, path: Path) -> None:
+    """
+    Persist scale params as JSON so serve_model.py can load the exact
+    training-time values instead of using hardcoded approximations.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(params, f, indent=2)
+    print(f"\n💾 Scale params saved to {path}")
 
-    n_countries = df["country_code"].nunique()
-    year_min, year_max = df["year"].min(), df["year"].max()
-    print(f"Countries: {n_countries}  |  Years: {year_min} - {year_max}")
 
-    # check for missing values
-    miss = df.isnull().sum()
-    miss = miss[miss > 0]
-    if miss.empty:
-        print("No missing values")
-    else:
-        print("\nMissing values:")
-        for col, n in miss.items():
-            print(f"  {col}: {n} ({n / len(df) * 100:.1f}%)")
+# ---------------------------------------------------------------------------
+# Step 5 — EDA metrics (logged to MLflow, not just printed)
+# ---------------------------------------------------------------------------
+def compute_eda_metrics(df: pd.DataFrame) -> dict:
+    """
+    Compute key EDA statistics and return them as a flat dict so they can
+    be logged to MLflow as metrics — making every pipeline run comparable.
+    """
+    lag_cols = [c for c in df.columns if c.startswith("obesity_lag_") and "_scaled" not in c]
 
-    # basic stats
-    print("\nDescriptive stats:")
-    print(df[["target_diabetes", "feature_obesity"]].describe().round(2).to_string())
+    metrics = {
+        "n_countries":        int(df["country_code"].nunique()),
+        "year_min":           int(df["year"].min()),
+        "year_max":           int(df["year"].max()),
+        "n_rows_total":       len(df),
+        "n_rows_complete":    int(df.dropna().shape[0]),
+        "diabetes_mean":      round(float(df["target_diabetes"].mean()), 4),
+        "diabetes_std":       round(float(df["target_diabetes"].std()), 4),
+        "diabetes_min":       round(float(df["target_diabetes"].min()), 4),
+        "diabetes_max":       round(float(df["target_diabetes"].max()), 4),
+        "obesity_mean":       round(float(df["feature_obesity"].mean()), 4),
+        "obesity_std":        round(float(df["feature_obesity"].std()), 4),
+    }
 
-    # how correlated are the lags with diabetes — higher is better
-    lag_cols = [c for c in df.columns if c.startswith("obesity_lag_")]
-    if lag_cols:
-        print("\nCorrelation: obesity lags vs diabetes")
-        for col in lag_cols:
-            r = df[["target_diabetes", col]].dropna().corr().iloc[0, 1]
-            print(f"  {col}: r = {r:+.4f}")
+    # Lag correlations with diabetes — a useful feature-quality signal over time
+    for col in lag_cols:
+        r = df[["target_diabetes", col]].dropna().corr().iloc[0, 1]
+        metrics[f"corr_{col}_vs_diabetes"] = round(float(r), 4)
 
-    # which countries have the highest average diabetes rates
-    print("\nTop 10 countries by mean diabetes prevalence:")
-    top10 = (
-        df.groupby("country_code")["target_diabetes"]
-        .mean()
-        .sort_values(ascending=False)
-        .head(10)
-        .round(2)
-    )
-    for rank, (country, val) in enumerate(top10.items(), 1):
-        print(f"  {rank}. {country}: {val}%")
+    return metrics
 
-    # global trend every 5 years
-    print("\nGlobal averages (every 5 years):")
+
+def print_eda_summary(df: pd.DataFrame, metrics: dict) -> None:
+    print("\n── EDA summary ─────────────────────────────────────────────")
+    print(f"   Countries : {metrics['n_countries']}")
+    print(f"   Years     : {metrics['year_min']} – {metrics['year_max']}")
+    print(f"   Rows total: {metrics['n_rows_total']:,}  |  complete: {metrics['n_rows_complete']:,}")
+    print(f"\n   Diabetes  — mean: {metrics['diabetes_mean']}  std: {metrics['diabetes_std']}"
+          f"  range: [{metrics['diabetes_min']}, {metrics['diabetes_max']}]")
+    print(f"   Obesity   — mean: {metrics['obesity_mean']}  std: {metrics['obesity_std']}")
+
+    print("\n   Lag correlations with diabetes (higher = stronger signal):")
+    for key, val in metrics.items():
+        if key.startswith("corr_"):
+            col_name = key.replace("corr_", "").replace("_vs_diabetes", "")
+            print(f"     {col_name}: r = {val:+.4f}")
+
+    # Global trend every 5 years
+    print("\n   Global averages (every 5 years):")
     trend = df.groupby("year")[["target_diabetes", "feature_obesity"]].mean().round(2)
-    trend_sample = trend[trend.index % 5 == 0]
-    print(f"  {'Year':<8} {'Diabetes':>10} {'Obesity':>10}")
-    for yr, row in trend_sample.iterrows():
-        print(f"  {yr:<8} {row['target_diabetes']:>10} {row['feature_obesity']:>10}")
+    trend_5 = trend[trend.index % 5 == 0]
+    print(f"   {'Year':<8} {'Diabetes':>10} {'Obesity':>10}")
+    for yr, row in trend_5.iterrows():
+        print(f"   {yr:<8} {row['target_diabetes']:>10} {row['feature_obesity']:>10}")
 
-    # fit a linear slope per country to find who's rising fastest
-    print("\nFastest rising diabetes by country (pp/year):")
+    # Fastest rising countries
+    print("\n   Fastest rising diabetes (pp/year):")
     slopes = {}
     for country, grp in df.groupby("country_code"):
         grp = grp.dropna(subset=["target_diabetes"]).sort_values("year")
         if len(grp) >= 5:
-            slope = np.polyfit(grp["year"], grp["target_diabetes"], 1)[0]
-            slopes[country] = slope
-    for country in sorted(slopes, key=slopes.get, reverse=True)[:10]:
-        print(f"  {country}: +{slopes[country]:.4f} pp/year")
+            slopes[country] = np.polyfit(grp["year"], grp["target_diabetes"], 1)[0]
+    for country in sorted(slopes, key=slopes.get, reverse=True)[:5]:
+        print(f"     {country}: +{slopes[country]:.4f} pp/year")
+    print("─" * 60)
 
 
+# ---------------------------------------------------------------------------
+# Step 6 — Save feature parquet
+# ---------------------------------------------------------------------------
 def save_features(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False, engine="fastparquet")
-    print(f"\nSaved to {path}  ({df.shape[0]:,} rows x {df.shape[1]} cols)")
+    df.to_parquet(path, index=False, engine="pyarrow")
+    print(f"\n✅ Features saved to {path}  ({df.shape[0]:,} rows × {df.shape[1]} cols)")
 
 
-def run_feature_pipeline():
-    print("Starting feature pipeline...")
+# ---------------------------------------------------------------------------
+# Pipeline entry point
+# ---------------------------------------------------------------------------
+def run_feature_pipeline() -> tuple[pd.DataFrame, dict]:
+    print("🚀 Starting feature engineering pipeline...")
 
-    df = load_raw(RAW_DATA_PATH)
-    df = select_core(df)
+    mlflow.set_tracking_uri(MLFLOW_TRACKING)
+    mlflow.set_experiment(EXPERIMENT_NAME)
 
-    print(f"\nAdding lags: {LAG_YEARS}")
-    df = add_temporal_lags(df, LAG_YEARS)
+    with mlflow.start_run(run_name="feature_engineering") as run:
 
-    print("\nScaling to N(0,1)...")
-    df, scale_params = standard_scale(df)
+        # ── Steps ───────────────────────────────────────────────────────────
+        df = load_clean(CLEAN_DATA_PATH)
+        df = select_core(df)
 
-    # print scale params — you'll need these to scale new data at inference time
-    print("\nScale params:")
-    for col, p in scale_params.items():
-        print(f"  {col}: mean={p['mean']}  std={p['std']}")
+        print(f"\nAdding temporal lags: {LAG_YEARS}")
+        df = add_temporal_lags(df, LAG_YEARS)
 
-    run_eda(df)
-    save_features(df, FEATURES_DATA_PATH)
+        print("\nScaling features to N(0,1)...")
+        df, scale_params = standard_scale(df)
 
-    print("\nDone.")
+        # ── Persist scale params ─────────────────────────────────────────────
+        save_scale_params(scale_params, SCALE_PARAMS_PATH)
+
+        # ── EDA ─────────────────────────────────────────────────────────────
+        eda_metrics = compute_eda_metrics(df)
+        print_eda_summary(df, eda_metrics)
+
+        # ── Save features ────────────────────────────────────────────────────
+        save_features(df, FEATURES_DATA_PATH)
+
+        # ── Log to MLflow ────────────────────────────────────────────────────
+        mlflow.log_param("lag_years",          LAG_YEARS)
+        mlflow.log_param("clean_data_path",    str(CLEAN_DATA_PATH))
+        mlflow.log_param("features_path",      str(FEATURES_DATA_PATH))
+        mlflow.log_param("scale_params_path",  str(SCALE_PARAMS_PATH))
+        mlflow.log_param("scaled_columns",     list(scale_params.keys()))
+
+        # Log scale params so every run's exact scalers are in MLflow
+        for col, p in scale_params.items():
+            mlflow.log_param(f"scale_mean_{col}", p["mean"])
+            mlflow.log_param(f"scale_std_{col}",  p["std"])
+
+        # Log EDA metrics for trend monitoring across pipeline runs
+        for metric_name, value in eda_metrics.items():
+            mlflow.log_metric(metric_name, value)
+
+        # Log the scale params JSON as an artifact for full reproducibility
+        mlflow.log_artifact(str(SCALE_PARAMS_PATH))
+
+        mlflow.set_tag("stage",  "feature_engineering")
+        mlflow.set_tag("status", "SUCCESS")
+
+        print(f"\n   MLflow run: {run.info.run_id}")
+        print("🏁 Feature pipeline complete.\n")
+
     return df, scale_params
 
 

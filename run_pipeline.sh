@@ -3,112 +3,214 @@
 # ==============================================================
 # Usage: bash run_pipeline.sh
 #
-# Runs the 5-step data/training pipeline, then launches:
-#   - MLflow UI        → http://127.0.0.1:5000
-#   - FastAPI server   → http://127.0.0.1:8000
-#   - Dashboard        → dashboard.html (opens in browser)
+# Runs the full pipeline in order:
+#   1.  Create logs directory
+#   2.  Start MLflow UI (background)
+#   3.  Fetch data from WHO API
+#   4.  Clean raw data
+#   5.  Validate clean data        ← exits with code 1 if hard checks fail
+#   6.  Engineer features + save scale_params.json
+#   7.  Train both models & register in MLflow
+#   8.  Start FastAPI server (background)
+#          └─ serve_model.py runs promotion logic here, Ridge wins if within tolerance
+#   9.  Verify API health + confirm which model was promoted
+#   10. Run analysis scripts against the promoted Production run
+#   11. Generate dashboard HTML
+#   12. Open dashboard in browser
 #
 # Press Ctrl+C once to shut everything down cleanly.
 
-set -e
+set -e   # exit immediately if any command fails
 
 # ---------------------------------------------------------------------------
-# Cleanup: kill background servers when the script exits (Ctrl+C or error)
+# Cleanup: kill background servers on exit (Ctrl+C or pipeline error)
 # ---------------------------------------------------------------------------
+MLFLOW_PID=""
+API_PID=""
+
 cleanup() {
   echo ""
   echo "Shutting down servers..."
-  kill "$MLFLOW_PID" "$API_PID" 2>/dev/null
+  [ -n "$MLFLOW_PID" ] && kill "$MLFLOW_PID" 2>/dev/null
+  [ -n "$API_PID"    ] && kill "$API_PID"    2>/dev/null
   echo "Done."
 }
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# Step 1–5: Data pipeline
+# Header
 # ---------------------------------------------------------------------------
-echo "==============================="
-echo " NSDC Diabetes MLOps Pipeline"
-echo "==============================="
-
 echo ""
-echo "1. Fetching data..."
+echo "╔══════════════════════════════════════╗"
+echo "║   NSDC Diabetes MLOps Pipeline       ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 1: Create logs directory FIRST (before anything tries to write to it)
+# ---------------------------------------------------------------------------
+echo "1. Setting up logs directory..."
+mkdir -p logs
+echo "   ✅ logs/ ready"
+
+# ---------------------------------------------------------------------------
+# Step 2: Start MLflow UI BEFORE pipeline scripts run
+#         Every script logs to MLflow, so it must be up first.
+# ---------------------------------------------------------------------------
+echo ""
+echo "2. Starting MLflow UI at http://127.0.0.1:5000 ..."
+mlflow ui --host 127.0.0.1 --port 5000 > logs/mlflow.log 2>&1 &
+MLFLOW_PID=$!
+echo "   Waiting for MLflow to be ready..."
+sleep 4
+echo "   ✅ MLflow UI running (PID $MLFLOW_PID)"
+
+# ---------------------------------------------------------------------------
+# Step 3: Fetch data from WHO API (with retry logic)
+# ---------------------------------------------------------------------------
+echo ""
+echo "3. Fetching data from WHO API..."
 python src/fetch_data.py
 
+# ---------------------------------------------------------------------------
+# Step 4: Clean raw data
+#         Must run BEFORE validation — we validate the clean file, not raw.
+# ---------------------------------------------------------------------------
 echo ""
-echo "2. Validating data..."
-python src/validate_data.py
-
-echo ""
-echo "3. Cleaning data..."
+echo "4. Cleaning raw data..."
 python src/cleaning.py
 
+# ---------------------------------------------------------------------------
+# Step 5: Validate clean data
+#         Will exit with code 1 if any hard check fails, stopping the pipeline.
+# ---------------------------------------------------------------------------
 echo ""
-echo "4. Engineering features..."
+echo "5. Validating clean data..."
+python src/validate_data.py
+
+# ---------------------------------------------------------------------------
+# Step 6: Feature engineering — also saves scale_params.json
+# ---------------------------------------------------------------------------
+echo ""
+echo "6. Engineering features..."
 python src/features.py
 
+# ---------------------------------------------------------------------------
+# Step 7: Train both models and register in MLflow registry
+# ---------------------------------------------------------------------------
 echo ""
-echo "5. Training model & logging to MLflow..."
+echo "7. Training models (Linear Regression + Ridge)..."
 python src/train_model.py
 
 # ---------------------------------------------------------------------------
-# Step 6: Generate dashboard
-# ---------------------------------------------------------------------------
-echo ""
-echo "6. Generating dashboard..."
-python src/generate_dashboard.py
-
-# ---------------------------------------------------------------------------
-# Step 7: Start MLflow UI in background
-# ---------------------------------------------------------------------------
-echo ""
-echo "7. Starting MLflow UI at http://127.0.0.1:5000 ..."
-mlflow ui --host 127.0.0.1 --port 5000 > logs/mlflow.log 2>&1 &
-MLFLOW_PID=$!
-
-# Give MLflow a moment to start before the API tries to connect
-echo "   Waiting for MLflow to be ready..."
-sleep 4
-
-# ---------------------------------------------------------------------------
-# Step 8: Start FastAPI server in background
+# Step 8: Start FastAPI server — promotion happens here at startup
+#         serve_model.py runs promote_best_model() which applies the Ridge
+#         preference logic and tags the winning model as Production.
+#         Analysis scripts in Step 10 must run AFTER this so they query
+#         the correct Production run.
 # ---------------------------------------------------------------------------
 echo ""
 echo "8. Starting API server at http://127.0.0.1:8000 ..."
-mkdir -p logs
+echo "   (Promotion logic runs here — Ridge preferred if within tolerance)"
 python src/serve_model.py > logs/api.log 2>&1 &
 API_PID=$!
-
-# Give the API a moment to load the model
-echo "   Waiting for API to be ready..."
-sleep 5
+echo "   Waiting for API to promote model and be ready..."
+sleep 6
+echo "   ✅ API server running (PID $API_PID)"
 
 # ---------------------------------------------------------------------------
-# Step 9: Open dashboard in browser
+# Step 9: Verify API health and confirm which model was promoted
+#         This must appear BEFORE analysis scripts so you can see the
+#         promotion decision in the terminal output.
 # ---------------------------------------------------------------------------
 echo ""
-echo "9. Opening dashboard..."
+echo "9. Verifying API health and promotion decision..."
+if command -v curl &>/dev/null; then
+  HEALTH=$(curl -s http://127.0.0.1:8000/health 2>/dev/null || echo "unreachable")
+  echo "   $HEALTH"
+
+  # Extract and surface the promotion reason clearly
+  if command -v python3 &>/dev/null; then
+    echo "$HEALTH" | python3 -c "
+import sys, json
+try:
+    h = json.load(sys.stdin)
+    print()
+    print('   ┌─ Production model ──────────────────────────────────')
+    print(f'   │  Type    : {h.get(\"model_type\", \"?\")}')
+    print(f'   │  Version : v{h.get(\"version\", \"?\")}')
+    print(f'   │  Test R² : {h.get(\"test_r2\", \"?\")}')
+    print(f'   │  CV R²   : {h.get(\"cv_r2\", \"?\")}')
+    print(f'   │  RMSE    : {h.get(\"test_rmse\", \"?\")}')
+    print(f'   │  Reason  : {h.get(\"promotion_reason\", \"?\")}')
+    print('   └─────────────────────────────────────────────────────')
+except: pass
+" 2>/dev/null || true
+  fi
+else
+  echo "   (curl not available — check http://127.0.0.1:8000/health manually)"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 10: Analysis scripts — now run AFTER promotion so they query the
+#          correct Production run (Ridge, not Linear Regression)
+# ---------------------------------------------------------------------------
+echo ""
+echo "10. Running analysis scripts against Production model..."
+
+echo "    10a. Coefficient analysis..."
+python src/analyze_coefficients.py
+
+echo "    10b. Error visualisation..."
+python src/visualize_errors.py
+
+echo "    10c. Multicollinearity analysis..."
+python src/multicollinearity_analysis.py
+
+echo "    10d. Outlier detective..."
+python src/outlier_detective.py
+
+echo "    ✅ All analysis scripts complete"
+
+# ---------------------------------------------------------------------------
+# Step 11: Generate dashboard HTML
+# ---------------------------------------------------------------------------
+echo ""
+echo "11. Generating dashboard..."
+python src/generate_dashboard.py
+
+# ---------------------------------------------------------------------------
+# Step 12: Open dashboard in browser
+# ---------------------------------------------------------------------------
+echo ""
+echo "12. Opening dashboard..."
 if command -v open &>/dev/null; then
   open dashboard.html          # macOS
 elif command -v xdg-open &>/dev/null; then
   xdg-open dashboard.html      # Linux
+else
+  echo "    Open dashboard.html manually in your browser"
 fi
 
 # ---------------------------------------------------------------------------
-# Done — show status and keep running until Ctrl+C
+# All systems running
 # ---------------------------------------------------------------------------
 echo ""
-echo "==============================="
-echo " All systems running!"
-echo "==============================="
-echo " MLflow UI  → http://127.0.0.1:5000"
-echo " API server → http://127.0.0.1:8000"
-echo " API docs   → http://127.0.0.1:8000/docs"
-echo " Dashboard  → dashboard.html"
+echo "╔══════════════════════════════════════╗"
+echo "║   All systems running!               ║"
+echo "╠══════════════════════════════════════╣"
+echo "║  MLflow UI  → http://127.0.0.1:5000  ║"
+echo "║  API server → http://127.0.0.1:8000  ║"
+echo "║  API docs   → http://127.0.0.1:8000/docs ║"
+echo "║  Dashboard  → dashboard.html         ║"
+echo "╠══════════════════════════════════════╣"
+echo "║  Logs:                               ║"
+echo "║    logs/mlflow.log                   ║"
+echo "║    logs/api.log                      ║"
+echo "╠══════════════════════════════════════╣"
+echo "║  Press Ctrl+C to stop everything.    ║"
+echo "╚══════════════════════════════════════╝"
 echo ""
-echo " Logs: logs/mlflow.log | logs/api.log"
-echo ""
-echo " Press Ctrl+C to stop everything."
-echo "==============================="
 
-# Keep script alive so trap fires on Ctrl+C
+# Keep script alive so the trap fires cleanly on Ctrl+C
 wait
