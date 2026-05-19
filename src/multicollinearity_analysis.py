@@ -1,8 +1,8 @@
 """
 multicollinearity_analysis.py — Redundancy Auditor (Ava)
 =========================================================
-Checks whether the 1y, 2y, and 3y obesity lag features are too
-similar to each other (multicollinearity), which can destabilise
+Checks whether the obesity_level and obesity_trend features are
+correlated with each other (multicollinearity), which can destabilise
 linear regression coefficients even when the overall R² looks fine.
 
 Two complementary diagnostics are produced:
@@ -32,31 +32,28 @@ from pathlib import Path
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 import mlflow
-from mlflow import MlflowClient
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-FEATURES_PATH    = Path("data/processed/features.parquet")
-HEATMAP_PATH     = Path("multicollinearity_heatmap.png")
-VIF_PATH         = Path("vif_scores.png")
-MLFLOW_TRACKING  = "http://127.0.0.1:5000"
-EXPERIMENT_NAME  = "NSDC_Diabetes_Project"
+# FIX: FEATURES_PATH removed — imported from config.py.
+# FIX: MODEL_FEATURE_COLS removed — it was an exact duplicate of FEATURE_COLS
+#      imported from config.py and never cross-checked against it. Any drift
+#      between the two would silently produce wrong VIF/heatmap results.
+#      All references below now use FEATURE_COLS directly.
+from config import (
+    MLFLOW_TRACKING, EXPERIMENT_NAME,
+    FEATURE_COLS, get_production_run_id,
+    FEATURES_PATH,
+)
 
-# The four model features — must match train_model.py FEATURE_COLS
-MODEL_FEATURE_COLS = [
-    "feature_obesity_scaled",
-    "obesity_lag_1y_scaled",
-    "obesity_lag_2y_scaled",
-    "obesity_lag_3y_scaled",
-]
+HEATMAP_PATH = Path("multicollinearity_heatmap.png")
+VIF_PATH     = Path("vif_scores.png")
 
 # Human-readable labels for plots
 LABELS = {
-    "feature_obesity_scaled":  "Current obesity",
-    "obesity_lag_1y_scaled":   "Lag 1y",
-    "obesity_lag_2y_scaled":   "Lag 2y",
-    "obesity_lag_3y_scaled":   "Lag 3y",
+    "obesity_level_scaled": "Obesity level (current %)",
+    "obesity_trend_scaled": "Obesity trend (pp/year, 3yr slope)",
 }
 
 # VIF severity thresholds
@@ -67,23 +64,16 @@ VIF_HIGH     = 10
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def get_production_run_id() -> str:
-    """Ask the live API which run is in Production — single source of truth."""
-    import requests
-    data = requests.get("http://127.0.0.1:8000/health", timeout=5).json()
-    return data["run_id"]
-
-
 def load_features(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
             f"Features not found at '{path}'. Run features.py first."
         )
     df = pd.read_parquet(path, engine="pyarrow")
-    missing = [c for c in MODEL_FEATURE_COLS if c not in df.columns]
+    missing = [c for c in FEATURE_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Features file is missing columns: {missing}")
-    return df.dropna(subset=MODEL_FEATURE_COLS)
+    return df.dropna(subset=FEATURE_COLS)
 
 
 # ---------------------------------------------------------------------------
@@ -96,14 +86,14 @@ def compute_vif(df: pd.DataFrame) -> pd.DataFrame:
     on all other features. A high VIF means that feature is nearly
     redundant — other features already explain most of its variance.
     """
-    X = df[MODEL_FEATURE_COLS].values
+    X = df[FEATURE_COLS].values  # FIX: was MODEL_FEATURE_COLS
     vif_scores = [
         variance_inflation_factor(X, i)
         for i in range(X.shape[1])
     ]
     vif_df = pd.DataFrame({
-        "feature": MODEL_FEATURE_COLS,
-        "label":   [LABELS[c] for c in MODEL_FEATURE_COLS],
+        "feature": FEATURE_COLS,  # FIX: was MODEL_FEATURE_COLS
+        "label":   [LABELS[c] for c in FEATURE_COLS],
         "VIF":     vif_scores,
     }).sort_values("VIF", ascending=False).reset_index(drop=True)
 
@@ -158,12 +148,10 @@ def plot_vif(vif_df: pd.DataFrame) -> None:
     bars = ax.barh(vif_df["label"], vif_df["VIF"], color=colors,
                    edgecolor="white", linewidth=0.5, height=0.5)
 
-    # Value labels
     for bar, val in zip(bars, vif_df["VIF"]):
         ax.text(val + 0.1, bar.get_y() + bar.get_height() / 2,
                 f"{val:.2f}", va="center", fontsize=10)
 
-    # Threshold lines
     ax.axvline(VIF_MODERATE, color="#EF9F27", linewidth=1.2,
                linestyle="--", label=f"Moderate threshold (VIF={VIF_MODERATE})")
     ax.axvline(VIF_HIGH,     color="#E24B4A", linewidth=1.2,
@@ -185,16 +173,14 @@ def plot_vif(vif_df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 def compute_correlation(df: pd.DataFrame) -> pd.DataFrame:
     """Pairwise Pearson correlation between all model features."""
-    corr = df[MODEL_FEATURE_COLS].corr()
-    # Rename index/columns to human labels for readability
-    label_map = {c: LABELS[c] for c in MODEL_FEATURE_COLS}
+    corr = df[FEATURE_COLS].corr()  # FIX: was MODEL_FEATURE_COLS
+    label_map = {c: LABELS[c] for c in FEATURE_COLS}
     return corr.rename(index=label_map, columns=label_map)
 
 
 def interpret_correlation(corr: pd.DataFrame) -> None:
     """Print and interpret the strongest pairwise correlations."""
     print("── Pairwise correlations ────────────────────────────────────")
-    # Extract upper triangle (avoid duplicate pairs)
     pairs = []
     cols = corr.columns.tolist()
     for i in range(len(cols)):
@@ -213,11 +199,8 @@ def interpret_correlation(corr: pd.DataFrame) -> None:
 
     max_r = max(abs(r) for _, _, r in pairs)
     if max_r > 0.95:
-        print("  ⚠️  Very high inter-lag correlation detected (r > 0.95).")
-        print("     This is expected for closely-spaced time lags on the same")
-        print("     underlying trend. The model still works but coefficient")
-        print("     signs may flip between retraining runs — use VIF to decide")
-        print("     whether to drop a lag.")
+        print("  ⚠️  Very high correlation detected (r > 0.95).")
+        print("     Consider whether the features are capturing distinct signals.")
     else:
         print("  ✅ No extreme pairwise correlations (all r < 0.95).")
     print("─" * 60)
@@ -227,7 +210,7 @@ def plot_heatmap(corr: pd.DataFrame) -> None:
     """Annotated correlation heatmap for the four model features."""
     fig, ax = plt.subplots(figsize=(7, 5))
     mask = np.zeros_like(corr, dtype=bool)
-    mask[np.triu_indices_from(mask)] = True      # show lower triangle + diagonal
+    mask[np.triu_indices_from(mask, k=1)] = True
 
     sns.heatmap(
         corr,
@@ -244,7 +227,7 @@ def plot_heatmap(corr: pd.DataFrame) -> None:
     )
     ax.set_title(
         "Feature correlation heatmap\n"
-        "Obesity lag features: current, 1y, 2y, 3y",
+        "Obesity level vs obesity trend (3yr slope)",
         fontsize=12,
     )
     plt.tight_layout()
@@ -258,7 +241,6 @@ def plot_heatmap(corr: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 def analyze_multicollinearity() -> None:
     mlflow.set_tracking_uri(MLFLOW_TRACKING)
-    client = MlflowClient()
 
     # ── 1. Load features ──────────────────────────────────────────────────────
     print("📂 Loading features...")
@@ -277,24 +259,26 @@ def analyze_multicollinearity() -> None:
 
     # ── 4. Log everything to the Production training run ──────────────────────
     run_id = get_production_run_id()
-    print(f"\n📎 Logging artifacts to Production run {run_id}...")
 
-    with mlflow.start_run(run_id=run_id):
-        # Log VIF scores as metrics for trend monitoring
-        for col, vif_val in vif_summary.items():
-            mlflow.log_metric(f"vif_{col}", vif_val)
+    if run_id:
+        print(f"\n📎 Logging artifacts to Production run {run_id}...")
+        with mlflow.start_run(run_id=run_id):
+            for col, vif_val in vif_summary.items():
+                mlflow.log_metric(f"vif_{col}", vif_val)
 
-        # Log max pairwise correlation as a single summary metric
-        corr_vals = corr.values
-        np.fill_diagonal(corr_vals, np.nan)
-        max_pairwise_r = float(np.nanmax(np.abs(corr_vals)))
-        mlflow.log_metric("max_pairwise_correlation", round(max_pairwise_r, 4))
+            corr_vals = corr.values.copy()
+            np.fill_diagonal(corr_vals, np.nan)
+            max_pairwise_r = float(np.nanmax(np.abs(corr_vals)))
+            mlflow.log_metric("max_pairwise_correlation", round(max_pairwise_r, 4))
 
-        # Log plot artifacts
-        mlflow.log_artifact(str(HEATMAP_PATH))
-        mlflow.log_artifact(str(VIF_PATH))
+            mlflow.log_artifact(str(HEATMAP_PATH))
+            mlflow.log_artifact(str(VIF_PATH))
 
-    print(f"   VIF scores and plots logged to MLflow run {run_id}")
+        print(f"   VIF scores and plots logged to MLflow run {run_id}")
+    else:
+        print("\n⚠️  Skipping MLflow logging — no Production run reachable.")
+        print(f"   Plots saved locally: {VIF_PATH}, {HEATMAP_PATH}")
+
     print("\n🏁 Multicollinearity analysis complete.")
 
 

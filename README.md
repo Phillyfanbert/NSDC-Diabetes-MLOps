@@ -6,7 +6,7 @@ An end-to-end MLOps pipeline that predicts global diabetes prevalence using hist
 
 ## What This Project Does
 
-The pipeline pulls live obesity and diabetes data from the WHO API across 200+ countries and multiple decades, engineers temporal lag features to capture the delayed biological relationship between obesity and diabetes, trains and compares two regression models, automatically promotes the best model to production, and serves predictions through a REST API and interactive dashboard.
+The pipeline pulls live obesity and diabetes data from the WHO API across 200+ countries and multiple decades, engineers obesity level and trend features to capture both the absolute burden and rate of change of obesity, trains and compares two regression models, automatically promotes the best model to production, and serves predictions through a REST API and interactive dashboard.
 
 A single command runs the entire system from raw data to live predictions:
 
@@ -74,7 +74,7 @@ When you run `bash run_pipeline.sh`, here is what happens:
 | 2 | `src/fetch_data.py` | Fetches live diabetes and obesity data from the WHO GHO API and saves a joined Parquet file |
 | 3 | `src/cleaning.py` | Drops ~36 metadata columns, converts strings to floats, saves a clean Parquet file |
 | 4 | `src/validate_data.py` | Enforces the data contract — halts the pipeline if any check fails |
-| 5 | `src/features.py` | Adds 1y, 2y, 3y obesity lag features; Z-score scales everything; saves `scale_params.json` |
+| 5 | `src/features.py` | Computes obesity level and 3yr trend slope; Z-score scales both; saves `scale_params.json` |
 | 6 | `src/train_model.py` | Trains Linear Regression and Ridge Regression; logs all metrics and artifacts to MLflow |
 | 7 | `src/serve_model.py` | Promotes the best model to Production; starts the FastAPI prediction server |
 | 8–11 | Analysis scripts | Runs coefficient analysis, error visualization, VIF/multicollinearity analysis, and outlier detection against the Production model |
@@ -93,8 +93,8 @@ http://127.0.0.1:5000
 ```
 
 Expected results:
-- Linear Regression: test R² ≈ 0.698, RMSE ≈ 2.17
-- Ridge Regression: test R² ≈ 0.700, RMSE ≈ 2.16
+- Linear Regression: test R² ≈ 0.603, RMSE ≈ 2.796
+- Ridge Regression: test R² ≈ 0.603, RMSE ≈ 2.796
 - Ridge is automatically promoted to Production
 
 ### Prediction API
@@ -110,9 +110,7 @@ Example request body:
 ```json
 {
   "obesity_current": 28.5,
-  "obesity_lag_1y": 27.1,
-  "obesity_lag_2y": 25.8,
-  "obesity_lag_3y": 24.3
+  "obesity_trend": 0.45
 }
 ```
 
@@ -154,7 +152,7 @@ NSDC-Diabetes-MLOps/
 │   ├── fetch_data.py               # WHO API ingestion
 │   ├── cleaning.py                 # Data preprocessing
 │   ├── validate_data.py            # Data contract enforcement
-│   ├── features.py                 # Lag features + Z-score scaling
+│   ├── features.py                 # Obesity level + trend features + Z-score scaling
 │   ├── train_model.py              # Model training + MLflow logging
 │   ├── serve_model.py              # Model promotion + FastAPI server
 │   ├── analyze_coefficients.py     # Feature coefficient bar chart
@@ -168,6 +166,7 @@ NSDC-Diabetes-MLOps/
 │   ├── clean/                      # Cleaned Parquet (auto-generated)
 │   └── processed/                  # Feature-engineered Parquet + scale_params.json
 ├── logs/                           # MLflow and API server logs
+├── src/config.py                   # Shared constants (paths, model name, feature cols)
 ├── run_pipeline.sh                 # Master orchestrator script
 ├── requirements.txt
 └── .gitignore
@@ -214,5 +213,5 @@ lsof -ti:8000 | xargs kill -9
 WHO Global Health Observatory (GHO) API
 - Diabetes: indicator `NCD_GLUC_04`
 - Obesity: indicator `NCD_BMI_30A`
-- Coverage: 200+ countries, 1995–2024
+- Coverage: 200+ countries, 1992–2014
 ```

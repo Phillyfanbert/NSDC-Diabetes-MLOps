@@ -62,7 +62,16 @@ echo "2. Starting MLflow UI at http://127.0.0.1:5000 ..."
 mlflow ui --host 127.0.0.1 --port 5000 > logs/mlflow.log 2>&1 &
 MLFLOW_PID=$!
 echo "   Waiting for MLflow to be ready..."
-sleep 4
+for i in $(seq 1 15); do
+  if curl -s http://127.0.0.1:5000 > /dev/null 2>&1; then
+    echo "   ✅ MLflow UI ready (after ${i}s)"
+    break
+  fi
+  sleep 1
+  if [ "$i" -eq 15 ]; then
+    echo "   ⚠️  MLflow didn't respond in 15s — continuing anyway"
+  fi
+done
 echo "   ✅ MLflow UI running (PID $MLFLOW_PID)"
 
 # ---------------------------------------------------------------------------
@@ -102,6 +111,10 @@ echo ""
 echo "7. Training models (Linear Regression + Ridge)..."
 python src/train_model.py
 
+# Kill any process still holding port 8000 from a previous run
+echo "   Clearing port 8000..."
+lsof -ti:8000 | xargs kill -9 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
 # Step 8: Start FastAPI server — promotion happens here at startup
 #         serve_model.py runs promote_best_model() which applies the Ridge
@@ -115,7 +128,16 @@ echo "   (Promotion logic runs here — Ridge preferred if within tolerance)"
 python src/serve_model.py > logs/api.log 2>&1 &
 API_PID=$!
 echo "   Waiting for API to promote model and be ready..."
-sleep 6
+for i in $(seq 1 30); do
+  if curl -s http://127.0.0.1:8000/health > /dev/null 2>&1; then
+    echo "   ✅ API server ready (after ${i}s)"
+    break
+  fi
+  sleep 1
+  if [ "$i" -eq 30 ]; then
+    echo "   ⚠️  API didn't respond in 30s — check logs/api.log"
+  fi
+done
 echo "   ✅ API server running (PID $API_PID)"
 
 # ---------------------------------------------------------------------------
@@ -211,6 +233,5 @@ echo "╠═══════════════════════�
 echo "║  Press Ctrl+C to stop everything.    ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
-
-# Keep script alive so the trap fires cleanly on Ctrl+C
-wait
+echo "   Servers running. Press Ctrl+C to stop."
+wait $MLFLOW_PID $API_PID

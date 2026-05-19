@@ -10,7 +10,6 @@ Usage:
     python src/analyze_coefficients.py
 """
 from __future__ import annotations
-from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -24,38 +23,23 @@ from mlflow import MlflowClient
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-REGISTERED_MODEL = "Diabetes_Prevalence_Model"
-EXPERIMENT_NAME  = "NSDC_Diabetes_Project"
-MLFLOW_TRACKING  = "http://127.0.0.1:5000"
 OUTPUT_PATH      = Path("coefficient_plot.png")
 
-# Must match FEATURE_COLS in train_model.py exactly
-FEATURE_COLS = [
-    "feature_obesity_scaled",
-    "obesity_lag_1y_scaled",
-    "obesity_lag_2y_scaled",
-    "obesity_lag_3y_scaled",
-]
+from config import (
+    MLFLOW_TRACKING, REGISTERED_MODEL, EXPERIMENT_NAME,
+    FEATURE_COLS, get_production_run_id,
+)
 
 # Human-readable labels for the plot
 FEATURE_LABELS = {
-    "feature_obesity_scaled":  "Current obesity",
-    "obesity_lag_1y_scaled":   "Obesity 1 yr ago",
-    "obesity_lag_2y_scaled":   "Obesity 2 yrs ago",
-    "obesity_lag_3y_scaled":   "Obesity 3 yrs ago",
+    "obesity_level_scaled": "Obesity level (current %)",
+    "obesity_trend_scaled": "Obesity trend (pp/year, 3yr slope)",
 }
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def get_production_run_id() -> str:
-    """Ask the live API which run is in Production — single source of truth."""
-    import requests
-    data = requests.get("http://127.0.0.1:8000/health", timeout=5).json()
-    return data["run_id"]
-
-
 def build_coef_table(model, run_metrics: dict) -> pd.DataFrame:
     """
     Assemble a tidy coefficient table sorted by absolute magnitude.
@@ -100,31 +84,29 @@ def plot_coefficients(df: pd.DataFrame, metrics: dict, run_id: str) -> None:
     bars = ax.barh(df["label"], df["coefficient"], color=colors, edgecolor="white",
                    linewidth=0.5, height=0.55)
 
-    # Value labels on each bar
     for bar, val in zip(bars, df["coefficient"]):
         x_pos = val + (0.5 if val >= 0 else -0.5)
         ha    = "left" if val >= 0 else "right"
         ax.text(x_pos, bar.get_y() + bar.get_height() / 2,
                 f"{val:+.2f}", va="center", ha=ha, fontsize=10)
 
+    model_type = metrics.get("model_type", "Unknown")          # ← DYNAMIC
     ax.axvline(0, color="black", linewidth=0.8)
     ax.set_xlabel("Coefficient (weight on z-scored feature)", fontsize=11)
     ax.set_title(
-        f"Linear Regression — Feature Coefficients\n"
+        f"{model_type} — Feature Coefficients\n"               # ← FIXED LINE
         f"test R²={metrics.get('test_r2', '?')}  "
         f"test RMSE={metrics.get('test_rmse', '?')}  "
         f"· run {run_id[:8]}…",
         fontsize=12,
     )
 
-    # Legend patches
     from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor="steelblue", label="Positive — higher obesity → higher diabetes"),
-        Patch(facecolor="salmon",    label="Negative — suppressed by collinear lags"),
+        Patch(facecolor="steelblue", label="Positive — higher value → higher diabetes risk"),
+        Patch(facecolor="salmon",    label="Negative — higher value → lower diabetes risk"),
     ]
     ax.legend(handles=legend_elements, fontsize=9, loc="lower right")
-
     ax.grid(axis="x", alpha=0.25)
     plt.tight_layout()
     plt.savefig(OUTPUT_PATH, dpi=150, bbox_inches="tight")
@@ -146,9 +128,10 @@ def analyze_coefficients() -> None:
     # ── 2. Pull logged metrics from MLflow (no recomputation) ─────────────────
     run     = client.get_run(run_id)
     metrics = {
-        "train_r2":  round(run.data.metrics.get("train_r2",  float("nan")), 4),
-        "test_r2":   round(run.data.metrics.get("test_r2",   float("nan")), 4),
-        "test_rmse": round(run.data.metrics.get("test_rmse", float("nan")), 4),
+        "model_type": run.data.tags.get("model_type", "Unknown"),
+        "train_r2":   round(run.data.metrics.get("train_r2",  float("nan")), 4),
+        "test_r2":    round(run.data.metrics.get("test_r2",   float("nan")), 4),
+        "test_rmse":  round(run.data.metrics.get("test_rmse", float("nan")), 4),
     }
 
     # ── 3. Load Production model ───────────────────────────────────────────────

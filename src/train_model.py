@@ -15,20 +15,17 @@ from mlflow.models import infer_signature
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-FEATURES_PATH     = Path("data/processed/features.parquet")
-SCALE_PARAMS_PATH = Path("data/processed/scale_params.json")
-MLFLOW_TRACKING   = "http://127.0.0.1:5000"
-EXPERIMENT_NAME   = "NSDC_Diabetes_Project"
+# FIX: FEATURES_PATH and SCALE_PARAMS_PATH removed — imported from config.py.
+# FIX: REGISTERED_MODEL also imported so the hardcoded string literal in
+#      mlflow.sklearn.log_model() is replaced — previously "Diabetes_Prevalence_Model"
+#      was hardcoded, meaning a rename in config.py would silently break promotion.
+from config import (
+    MLFLOW_TRACKING, EXPERIMENT_NAME, REGISTERED_MODEL,
+    FEATURE_COLS, TARGET_COL,
+    FEATURES_PATH, SCALE_PARAMS_PATH,
+)
 
-FEATURE_COLS = [
-    "feature_obesity_scaled",
-    "obesity_lag_1y_scaled",
-    "obesity_lag_2y_scaled",
-    "obesity_lag_3y_scaled",
-]
-TARGET_COL   = "target_diabetes"
 TEST_SIZE    = 0.20
-RANDOM_STATE = 42
 CV_FOLDS     = 5
 
 # Alpha values to search over for Ridge — spans several orders of magnitude
@@ -141,52 +138,29 @@ def train_and_log(
     """
     Fit a model, evaluate it on train / test / CV, log everything to MLflow,
     and register it in the Model Registry. Returns the MLflow run ID.
-
-    Because serve_model.py promotes by test_r2 DESC, whichever model scores
-    higher on the held-out test set automatically becomes Production — no
-    manual intervention needed.
-
-    CV uses TimeSeriesSplit to respect temporal ordering within the training
-    set — consistent with the chronological train/test split and prevents
-    look-ahead bias inside the cross-validation folds.
-
-    FIX 2: pipeline_run_id is stamped as a tag on every run so
-    serve_model.py can filter to only this pipeline's models during promotion.
     """
-    with mlflow.start_run(run_name=run_name) as run:
-
-        # ── Fit ──────────────────────────────────────────────────────────────
+    with mlflow.start_run(run_name=run_name, nested=False) as run:
         model.fit(X_train, y_train)
 
-        # ── Metrics ──────────────────────────────────────────────────────────
-        print(f"\nMetrics — {run_name}:")
-        train_metrics = compute_metrics(y_train, model.predict(X_train), "Train")
-        test_metrics  = compute_metrics(y_test,  model.predict(X_test),  "Test")
+        train_preds = model.predict(X_train)
+        test_preds  = model.predict(X_test)
 
-        # TimeSeriesSplit for CV — respects temporal ordering, prevents
-        # look-ahead bias within cross-validation folds.
+        print("\n  Metrics:")
+        train_metrics = compute_metrics(y_train, train_preds, "Train")
+        test_metrics  = compute_metrics(y_test,  test_preds,  "Test")
+
+        # Cross-validation on training set only (TimeSeriesSplit)
         tscv = TimeSeriesSplit(n_splits=CV_FOLDS)
+        cv_r2_scores   = cross_val_score(model, X_train, y_train, cv=tscv, scoring="r2")
+        cv_rmse_scores = cross_val_score(model, X_train, y_train, cv=tscv,
+                                         scoring="neg_root_mean_squared_error")
+        cv_r2_mean  = float(cv_r2_scores.mean())
+        cv_r2_std   = float(cv_r2_scores.std())
+        cv_rmse_mean = float(-cv_rmse_scores.mean())
+        print(f"  CV         — R²: {cv_r2_mean:.4f} ± {cv_r2_std:.4f}  "
+              f"| RMSE: {cv_rmse_mean:.4f}")
 
-        cv_r2   = cross_val_score(
-            model, X_train, y_train, cv=tscv, scoring="r2"
-        )
-        cv_rmse = np.sqrt(-cross_val_score(
-            model, X_train, y_train, cv=tscv,
-            scoring="neg_mean_squared_error",
-        ))
-        cv_r2_mean   = float(cv_r2.mean())
-        cv_r2_std    = float(cv_r2.std())
-        cv_rmse_mean = float(cv_rmse.mean())
-        print(f"  CV ({CV_FOLDS}-fold, temporal)  — R²: {cv_r2_mean:.4f} ± {cv_r2_std:.4f}"
-              f"  |  RMSE: {cv_rmse_mean:.4f}")
-
-        # ── Coefficients ─────────────────────────────────────────────────────
-        print("\n  Coefficients:")
-        for feat, coef in zip(FEATURE_COLS, model.coef_):
-            print(f"    {feat}: {coef:+.4f}")
-        print(f"    intercept: {model.intercept_:+.4f}")
-
-        # ── Log params ───────────────────────────────────────────────────────
+        # ── Log params ────────────────────────────────────────────────────────
         mlflow.log_param("model_type",       model_type)
         mlflow.log_param("feature_cols",     FEATURE_COLS)
         mlflow.log_param("target_col",       TARGET_COL)
@@ -223,21 +197,21 @@ def train_and_log(
                 mlflow.log_artifact(script)
 
         # ── Log model ─────────────────────────────────────────────────────────
+        # FIX: replaced hardcoded "Diabetes_Prevalence_Model" string with
+        # REGISTERED_MODEL imported from config.py — a rename in config now
+        # propagates here automatically instead of silently breaking promotion.
         signature = infer_signature(X_train, model.predict(X_train))
         mlflow.sklearn.log_model(
             model,
             artifact_path="model",
             signature=signature,
-            registered_model_name=f"Diabetes_Prevalence_Model",
+            registered_model_name=REGISTERED_MODEL,
         )
 
         # ── Tags ──────────────────────────────────────────────────────────────
         mlflow.set_tag("stage",           "training")
         mlflow.set_tag("status",          "SUCCESS")
         mlflow.set_tag("model_type",      model_type)
-        # FIX 2: stamp pipeline_run_id so serve_model.py can scope promotion
-        # to only this pipeline's runs — stale runs from previous executions
-        # (potentially trained on different WHO data) are never promoted.
         mlflow.set_tag("pipeline_run_id", pipeline_run_id)
 
         print(f"\n  ✅ Logged — Run ID: {run.info.run_id}")

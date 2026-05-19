@@ -13,10 +13,8 @@ INDICATORS = {
     "target_diabetes": "NCD_GLUC_04",
     "feature_obesity":  "NCD_BMI_30A",
 }
-RAW_DATA_PATH    = Path("data/raw/diabetes_obesity_raw.parquet")
 WHO_BASE_URL     = "https://ghoapi.azureedge.net/api"
-MLFLOW_TRACKING  = "http://127.0.0.1:5000"
-EXPERIMENT_NAME  = "NSDC_Diabetes_Project"
+from config import MLFLOW_TRACKING, EXPERIMENT_NAME, RAW_DATA_PATH  # FIX: import RAW_DATA_PATH from config
 
 # Retry configuration
 MAX_RETRIES      = 3      # number of attempts per indicator
@@ -132,13 +130,11 @@ def run_ingestion_pipeline() -> None:
         master_df.to_parquet(RAW_DATA_PATH, index=False, engine="pyarrow")
 
         # ── 5: Log to MLflow ────────────────────────────────────────────────
-        # Parameters: what we fetched and how
         mlflow.log_param("indicators",       list(INDICATORS.values()))
         mlflow.log_param("sex_filter",       "SEX_BTSX")
         mlflow.log_param("output_path",      str(RAW_DATA_PATH))
         mlflow.log_param("max_retries",      MAX_RETRIES)
 
-        # Metrics: row counts for reproducibility checks
         mlflow.log_metric("rows_diabetes",   row_counts["target_diabetes"])
         mlflow.log_metric("rows_obesity",    row_counts["feature_obesity"])
         mlflow.log_metric("rows_merged",     len(master_df))

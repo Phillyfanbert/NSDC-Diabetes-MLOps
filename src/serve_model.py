@@ -14,8 +14,7 @@ Usage:
 Test with:
     curl -X POST http://127.0.0.1:8000/predict \
          -H "Content-Type: application/json" \
-         -d '{"obesity_current": 28.5, "obesity_lag_1y": 27.1,
-              "obesity_lag_2y": 25.8, "obesity_lag_3y": 24.3}'
+         -d '{"obesity_current": 28.5, "obesity_trend": 0.45}'
 """
 from __future__ import annotations
 
@@ -36,18 +35,11 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-EXPERIMENT_NAME   = "NSDC_Diabetes_Project"
-REGISTERED_MODEL  = "Diabetes_Prevalence_Model"
-MLFLOW_TRACKING   = "http://127.0.0.1:5000"
-SCALE_PARAMS_PATH = Path("data/processed/scale_params.json")
-
-# Column order must match FEATURE_COLS in train_model.py exactly
-FEATURE_COLS = [
-    "feature_obesity_scaled",
-    "obesity_lag_1y_scaled",
-    "obesity_lag_2y_scaled",
-    "obesity_lag_3y_scaled",
-]
+# FIX: SCALE_PARAMS_PATH removed — imported from config.py
+from config import (
+    MLFLOW_TRACKING, EXPERIMENT_NAME, REGISTERED_MODEL,
+    FEATURE_COLS, API_URL, SCALE_PARAMS_PATH,
+)
 
 # If Ridge test_r2 is within this gap of the best model, Ridge wins.
 # Rationale: equal predictive power + stable/interpretable coefficients
@@ -144,14 +136,12 @@ def promote_best_model(pipeline_run_id: str) -> tuple[str, dict]:
             f"Experiment '{EXPERIMENT_NAME}' not found. Run the pipeline first."
         )
 
-    # FIX 2: scope to this pipeline's runs only
     base_filter = (
         "tags.stage = 'training' "
         "and tags.status = 'SUCCESS' "
         f"and tags.pipeline_run_id = '{pipeline_run_id}'"
     )
 
-    # Best run overall (within this pipeline)
     all_runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
         filter_string=base_filter,
@@ -167,7 +157,6 @@ def promote_best_model(pipeline_run_id: str) -> tuple[str, dict]:
     best_overall = all_runs[0]
     best_test_r2 = best_overall.data.metrics.get("test_r2", float("nan"))
 
-    # Best Ridge run (within this pipeline)
     ridge_runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
         filter_string=base_filter + " and tags.model_type = 'Ridge'",
@@ -175,7 +164,6 @@ def promote_best_model(pipeline_run_id: str) -> tuple[str, dict]:
         max_results=1,
     )
 
-    # Decision
     if ridge_runs:
         ridge_run     = ridge_runs[0]
         ridge_test_r2 = ridge_run.data.metrics.get("test_r2", float("nan"))
@@ -214,7 +202,6 @@ def promote_best_model(pipeline_run_id: str) -> tuple[str, dict]:
     logger.info(f"   train_r2={train_r2:.4f} | test_r2={test_r2:.4f} "
                 f"| cv_r2={cv_r2:.4f} | test_rmse={test_rmse:.4f}")
 
-    # Register if needed
     model_uri = f"runs:/{run_id}/model"
     try:
         mv      = mlflow.register_model(model_uri=model_uri, name=REGISTERED_MODEL)
@@ -305,22 +292,11 @@ class PredictionRequest(BaseModel):
         description="Current-year obesity prevalence (%)",
         json_schema_extra={"example": 28.5},
     )
-    obesity_lag_1y: float = Field(
-        ..., ge=0, le=100,
-        description="Obesity prevalence 1 year ago (%)",
-        json_schema_extra={"example": 27.1},
+    obesity_trend: float = Field(
+        ...,
+        description="Obesity trend — pp/year over past 3 years (positive = rising)",
+        json_schema_extra={"example": 0.45},
     )
-    obesity_lag_2y: float = Field(
-        ..., ge=0, le=100,
-        description="Obesity prevalence 2 years ago (%)",
-        json_schema_extra={"example": 25.8},
-    )
-    obesity_lag_3y: float = Field(
-        ..., ge=0, le=100,
-        description="Obesity prevalence 3 years ago (%)",
-        json_schema_extra={"example": 24.3},
-    )
-
 
 class PredictionResponse(BaseModel):
     predicted_diabetes_prevalence_pct: float
@@ -373,10 +349,8 @@ def predict(request: PredictionRequest):
 
     try:
         scaled = np.array([[
-            scale_value(request.obesity_current, "feature_obesity", scale_params),
-            scale_value(request.obesity_lag_1y,  "obesity_lag_1y",  scale_params),
-            scale_value(request.obesity_lag_2y,  "obesity_lag_2y",  scale_params),
-            scale_value(request.obesity_lag_3y,  "obesity_lag_3y",  scale_params),
+            scale_value(request.obesity_current, "obesity_level", scale_params),
+            scale_value(request.obesity_trend,   "obesity_trend", scale_params),
         ]])
     except KeyError as e:
         raise HTTPException(status_code=500, detail=str(e))

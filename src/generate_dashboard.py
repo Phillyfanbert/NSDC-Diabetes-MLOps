@@ -174,9 +174,10 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ── Train vs test split note ──────────────────────────────────── -->
+  <!-- ── Overfit warning ───────────────────────────────────────────── -->
   <div class="warn-box" style="margin-bottom: 1.5rem; display:none;" id="overfit-warning">
-    <p>⚠️  Train R² is notably higher than Test R² — the model may be overfitting on the training years. This is expected for linear regression with highly collinear lag features.</p>
+    <p>⚠️  Train R² is notably higher than Test R² — the model may be overfitting on the training years.
+    This is expected for linear regression with highly collinear lag features.</p>
   </div>
 
   <!-- ── Promotion reason (populated from /health) ─────────────────── -->
@@ -194,14 +195,14 @@ HTML = """<!DOCTYPE html>
       <div class="divider-row"><span>Highest diabetes (Pacific)</span><span style="color: #a32d2d;">~30%</span></div>
       <div class="divider-row"><span>Lag window</span><span>1, 2, 3 years</span></div>
       <div class="divider-row"><span>CV R&sup2; (5-fold)</span><span id="m-cv-r2">…</span></div>
-      <div class="divider-row"><span>Train / test split year</span><span>2010</span></div>
-      <p class="split-note">Chronological split — test set = years &ge; 2010 (never seen during training)</p>
+      <div class="divider-row"><span>Train / test split year</span><span id="m-split-year">…</span></div>
+      <p class="split-note">Chronological split — test set = years &ge; <span id="m-split-year-note">…</span> (never seen during training)</p>
     </div>
 
     <div class="card">
       <p class="section-label">Make a prediction</p>
       <p style="font-size: 13px; color: #5f5e5a; margin-bottom: 1rem;">
-        Enter obesity prevalence values (%) to predict diabetes rate.
+        Enter the current obesity rate and how fast it is rising to predict diabetes prevalence.
         Calls <code>POST /predict</code> on the local API.
       </p>
 
@@ -211,19 +212,9 @@ HTML = """<!DOCTYPE html>
         <span class="val" id="v0">28.5</span>
       </div>
       <div class="slider-row">
-        <label>Obesity 1 yr ago %</label>
-        <input type="range" min="1" max="60" step="0.5" value="27.1" id="s1" oninput="sync(1,this.value)">
-        <span class="val" id="v1">27.1</span>
-      </div>
-      <div class="slider-row">
-        <label>Obesity 2 yrs ago %</label>
-        <input type="range" min="1" max="60" step="0.5" value="25.8" id="s2" oninput="sync(2,this.value)">
-        <span class="val" id="v2">25.8</span>
-      </div>
-      <div class="slider-row">
-        <label>Obesity 3 yrs ago %</label>
-        <input type="range" min="1" max="60" step="0.5" value="24.3" id="s3" oninput="sync(3,this.value)">
-        <span class="val" id="v3">24.3</span>
+        <label>Obesity trend (pp/yr)</label>
+        <input type="range" min="-2" max="2" step="0.05" value="0.45" id="s1" oninput="sync(1,this.value)">
+        <span class="val" id="v1">0.45</span>
       </div>
 
       <button class="predict-btn" onclick="runPredict()">
@@ -270,11 +261,12 @@ HTML = """<!DOCTYPE html>
         const res  = await fetch(API + '/health');
         const data = await res.json();
 
-        const testR2   = data.test_r2   ?? null;
-        const trainR2  = data.train_r2  ?? null;
-        const testRmse = data.test_rmse ?? null;
-        const cvR2     = data.cv_r2     ?? null;
-        const version  = data.version   ?? '?';
+        const testR2    = data.test_r2    ?? null;
+        const trainR2   = data.train_r2   ?? null;
+        const testRmse  = data.test_rmse  ?? null;
+        const cvR2      = data.cv_r2      ?? null;
+        const version   = data.version    ?? '?';
+        const splitYear = data.split_year ?? null;
 
         // Status badge
         const badge = document.getElementById('model-status-badge');
@@ -320,9 +312,9 @@ HTML = """<!DOCTYPE html>
           ? 'Linear Regression'
           : modelType;
         document.getElementById('m-version').textContent = modelLabel;
-        document.getElementById('m-version-sub').textContent =
-          'v' + version + ' · L2 regularised · 1/2/3yr lags'
-          .replace('L2 regularised · ', modelType === 'Ridge' ? 'L2 regularised · ' : '');
+        document.getElementById('m-version-sub').textContent = modelType === 'Ridge'
+          ? 'v' + version + ' · L2 regularised · 1/2/3yr lags'
+          : 'v' + version + ' · 1/2/3yr lags';
 
         // Promotion reason
         const reason = data.promotion_reason ?? null;
@@ -336,17 +328,31 @@ HTML = """<!DOCTYPE html>
           document.getElementById('m-cv-r2').textContent = cvR2.toFixed(4);
         }
 
+        // Split year — populated live from /health so it stays accurate
+        // if the data shifts the 80/20 boundary on retrain.
+        // Falls back to '?' if the API doesn't expose split_year yet
+        // (requires serve_model.py to include it in the /health response).
+        if (splitYear !== null) {
+          document.getElementById('m-split-year').textContent      = splitYear;
+          document.getElementById('m-split-year-note').textContent = splitYear;
+        } else {
+          document.getElementById('m-split-year').textContent      = '?';
+          document.getElementById('m-split-year-note').textContent = '?';
+        }
+
       } catch (e) {
         // API not reachable
         const badge = document.getElementById('model-status-badge');
         badge.textContent = 'API offline';
         badge.className   = 'badge badge-offline';
-        ['m-test-r2','m-train-r2','m-rmse','m-version'].forEach(id => {
+        ['m-test-r2', 'm-train-r2', 'm-rmse', 'm-version'].forEach(id => {
           document.getElementById(id).textContent = '—';
         });
         document.getElementById('m-test-r2-sub').textContent  = 'Start serve_model.py';
         document.getElementById('m-train-r2-sub').textContent = 'Start serve_model.py';
-        document.getElementById('m-cv-r2').textContent = '—';
+        document.getElementById('m-cv-r2').textContent        = '—';
+        document.getElementById('m-split-year').textContent      = '—';
+        document.getElementById('m-split-year-note').textContent = '?';
       }
     }
 
@@ -370,9 +376,7 @@ HTML = """<!DOCTYPE html>
 
       const body = {
         obesity_current: vals[0],
-        obesity_lag_1y:  vals[1],
-        obesity_lag_2y:  vals[2],
-        obesity_lag_3y:  vals[3]
+        obesity_trend:   vals[1]
       };
 
       try {

@@ -12,13 +12,13 @@ Usage:
     python src/visualize_errors.py
 """
 from __future__ import annotations
-from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from pathlib import Path
+import json
 
 import mlflow
 import mlflow.sklearn
@@ -27,23 +27,18 @@ from mlflow import MlflowClient
 # ---------------------------------------------------------------------------
 # Configuration — must match train_model.py exactly
 # ---------------------------------------------------------------------------
-FEATURES_PATH    = Path("data/processed/features.parquet")
-OUTPUT_PATH      = Path("predicted_vs_actual.png")
-MLFLOW_TRACKING  = "http://127.0.0.1:5000"
-EXPERIMENT_NAME  = "NSDC_Diabetes_Project"
-REGISTERED_MODEL = "Diabetes_Prevalence_Model"
+# FIX: FEATURES_PATH and SCALE_PARAMS_PATH removed — imported from config.py
+from config import (
+    MLFLOW_TRACKING, EXPERIMENT_NAME, REGISTERED_MODEL,
+    FEATURE_COLS, TARGET_COL, API_URL,
+    FEATURES_PATH, SCALE_PARAMS_PATH,
+    get_production_run_id,
+)
+
+OUTPUT_PATH = Path("predicted_vs_actual.png")
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING)
 client = MlflowClient()   # module-level so get_production_run() can use it
-
-FEATURE_COLS = [
-    "feature_obesity_scaled",
-    "obesity_lag_1y_scaled",
-    "obesity_lag_2y_scaled",
-    "obesity_lag_3y_scaled",
-]
-TARGET_COL = "target_diabetes"
-TEST_SIZE  = 0.20          # must match train_model.py
 
 
 # ---------------------------------------------------------------------------
@@ -51,46 +46,44 @@ TEST_SIZE  = 0.20          # must match train_model.py
 # ---------------------------------------------------------------------------
 def get_production_run() -> tuple[str, dict]:
     """
-    Ask the live API which run is in Production, then pull the full
-    training metrics for that run from MLflow. /health gives us the
-    run_id and serving metrics; MLflow gives us the complete picture
-    (train_rmse, cv_r2_std) that the health endpoint doesn't expose.
+    Resolve the Production run_id via config.get_production_run_id()
+    (API first, MLflow registry fallback), then pull the full training
+    metrics from MLflow. The health endpoint doesn't expose train_rmse
+    or cv_r2_std, so we always go to MLflow for the complete picture.
     """
-    import requests
-    data   = requests.get("http://127.0.0.1:8000/health", timeout=5).json()
-    run_id = data["run_id"]
+    run_id = get_production_run_id()   # API → registry fallback in config.py
 
-    # Pull complete metrics from MLflow using the run_id
-    run     = client.get_run(run_id)
-    m       = run.data.metrics
+    run = client.get_run(run_id)
+    m   = run.data.metrics
     metrics = {
-        "model_type": data.get("model_type",       "unknown"),
-        "train_r2":   m.get("train_r2",            float("nan")),
-        "train_rmse": m.get("train_rmse",           float("nan")),
-        "test_r2":    m.get("test_r2",              float("nan")),
-        "test_rmse":  m.get("test_rmse",            float("nan")),
-        "cv_r2_mean": m.get("cv_r2_mean",           float("nan")),
-        "cv_r2_std":  m.get("cv_r2_std",            float("nan")),
+        "model_type": run.data.tags.get("model_type",  "unknown"),
+        "train_r2":   m.get("train_r2",                float("nan")),
+        "train_rmse": m.get("train_rmse",               float("nan")),
+        "test_r2":    m.get("test_r2",                  float("nan")),
+        "test_rmse":  m.get("test_rmse",                float("nan")),
+        "cv_r2_mean": m.get("cv_r2_mean",               float("nan")),
+        "cv_r2_std":  m.get("cv_r2_std",                float("nan")),
     }
     return run_id, metrics
 
 
 def chronological_split(
     df: pd.DataFrame,
+    split_year: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     """
     Reproduce the exact same chronological split used in train_model.py
     so the visualisation reflects true train vs held-out test performance.
     """
     df_sorted  = df.sort_values("year").reset_index(drop=True)
-    split_idx  = int(len(df_sorted) * (1 - TEST_SIZE))
+    train_mask = df_sorted["year"] < split_year
 
     X = df_sorted[FEATURE_COLS]
     y = df_sorted[TARGET_COL]
 
     return (
-        X.iloc[:split_idx],  X.iloc[split_idx:],
-        y.iloc[:split_idx],  y.iloc[split_idx:],
+        X[train_mask],  X[~train_mask],
+        y[train_mask],  y[~train_mask],
     )
 
 
@@ -122,7 +115,6 @@ def scatter_panel(
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.25)
 
-    # Metrics box — pulled from MLflow, not recomputed
     ax.text(
         0.05, 0.95,
         f"R²:   {r2:.4f}\nRMSE: {rmse:.4f}",
@@ -148,8 +140,8 @@ def visualize_predictions() -> None:
     df = pd.read_parquet(FEATURES_PATH, engine="pyarrow").dropna(
         subset=FEATURE_COLS + [TARGET_COL]
     )
-    X_train, X_test, y_train, y_test = chronological_split(df)
-    split_year = int(df.sort_values("year").iloc[len(X_train)]["year"])
+    split_year = json.load(open(SCALE_PARAMS_PATH))["_meta"]["split_year"]
+    X_train, X_test, y_train, y_test = chronological_split(df, split_year)
     print(f"\nSplit reproduced at year {split_year} "
           f"({len(X_train):,} train / {len(X_test):,} test rows)")
 

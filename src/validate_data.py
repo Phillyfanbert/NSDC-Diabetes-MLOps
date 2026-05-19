@@ -8,12 +8,11 @@ import mlflow
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATA_PATH       = Path("data/clean/diabetes_obesity_clean.parquet")   # reads CLEAN, not raw
-MIN_YEAR        = 1975
-MAX_YEAR        = 2024
-MLFLOW_TRACKING = "http://127.0.0.1:5000"
-EXPERIMENT_NAME = "NSDC_Diabetes_Project"
+# FIX: DATA_PATH (hardcoded) removed — CLEAN_DATA_PATH imported from config.py
+from config import MLFLOW_TRACKING, EXPERIMENT_NAME, CLEAN_DATA_PATH
 
+MIN_YEAR        = 1985
+MAX_YEAR        = 2024
 REQUIRED_COLS   = ["country_code", "year", "target_diabetes", "feature_obesity"]
 PERCENT_COLS    = ["target_diabetes", "feature_obesity"]
 
@@ -89,11 +88,17 @@ def check_duplicates(df: pd.DataFrame) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Main validation runner
 # ---------------------------------------------------------------------------
-def validate_data(df: pd.DataFrame) -> bool:
+def validate_data(df: pd.DataFrame) -> tuple[bool, dict]:
     """
-    Run all checks and return True only if every hard check passes.
-    Missing-value check is a soft warning — it logs but does not fail the run,
-    because WHO data commonly has sparse coverage for some countries/years.
+    Run all checks and return (all_pass, results).
+
+    all_pass — True only if every *hard* check passes; False otherwise.
+    results  — dict keyed by check name, each value is:
+                 {"passed": bool, "detail": str, "hard": bool}
+
+    Missing-value check is a soft warning — it sets passed=False in results
+    but does NOT flip all_pass, because WHO data commonly has sparse coverage
+    for some countries/years.  Only hard checks gate the pipeline.
     """
     checks = [
         ("required_columns",   check_required_columns,   True),   # hard
@@ -106,7 +111,7 @@ def validate_data(df: pd.DataFrame) -> bool:
     results  = {}
     all_pass = True
 
-    print(f"\nValidating: {DATA_PATH}")
+    print(f"\nValidating: {CLEAN_DATA_PATH}")
     print(f"Shape: {df.shape[0]:,} rows × {df.shape[1]} columns\n")
 
     for name, fn, is_hard in checks:
@@ -130,11 +135,11 @@ def run_validation_pipeline() -> None:
     mlflow.set_tracking_uri(MLFLOW_TRACKING)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
-    df = load_data(DATA_PATH)
+    df = load_data(CLEAN_DATA_PATH)
 
     with mlflow.start_run(run_name="data_validation") as run:
 
-        mlflow.log_param("data_path",  str(DATA_PATH))
+        mlflow.log_param("data_path",  str(CLEAN_DATA_PATH))
         mlflow.log_param("min_year",   MIN_YEAR)
         mlflow.log_param("max_year",   MAX_YEAR)
         mlflow.log_metric("rows",      df.shape[0])
@@ -142,11 +147,9 @@ def run_validation_pipeline() -> None:
 
         all_pass, results = validate_data(df)
 
-        # Log each check result as a metric (1 = pass, 0 = fail)
         for name, r in results.items():
             mlflow.log_metric(f"check_{name}", int(r["passed"]))
 
-        # Log missing-value counts per column as metrics for trend monitoring
         for col in REQUIRED_COLS:
             n_missing = int(df[col].isnull().sum())
             mlflow.log_metric(f"missing_{col}", n_missing)
@@ -162,11 +165,9 @@ def run_validation_pipeline() -> None:
             print("❌ VALIDATION FAILED — pipeline halted")
             print(f"   MLflow run: {run.info.run_id}")
             print("   Fix the issues above before re-running.")
-        print("=" * 40)
 
-        # Hard exit with non-zero code so run_pipeline.sh stops on failure
-        if not all_pass:
-            sys.exit(1)
+    if not all_pass:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
