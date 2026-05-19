@@ -22,7 +22,6 @@ Interpretation guide (printed to console and logged to MLflow):
     VIF > 10         → severe, consider dropping the feature
 """
 from __future__ import annotations
-from __future__ import annotations
 
 import numpy as np
 import pandas as pd

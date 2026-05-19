@@ -64,19 +64,39 @@ client = MlflowClient()
 # ---------------------------------------------------------------------------
 # Scale params
 # ---------------------------------------------------------------------------
-def load_scale_params(path: Path) -> dict:
-    """Load exact mean/std values from feature engineering. No approximations."""
+def load_scale_params(path: Path) -> tuple[dict, str]:
+    """
+    Load exact mean/std values from feature engineering. No approximations.
+
+    FIX 2: Also reads pipeline_run_id from the _meta block so
+    promote_best_model() can scope its search to only this pipeline's runs.
+
+    Returns (params_dict, pipeline_run_id). The _meta key is stripped from
+    the returned params dict so the rest of the code is unaffected.
+    """
     if not path.exists():
         raise FileNotFoundError(
             f"Scale params not found at '{path}'. "
             "Run features.py first to generate scale_params.json."
         )
     with open(path) as f:
-        params = json.load(f)
+        raw = json.load(f)
+
+    meta            = raw.pop("_meta", {})
+    pipeline_run_id = str(meta.get("pipeline_run_id", ""))
+    params          = raw   # everything except _meta
+
+    if not pipeline_run_id:
+        raise ValueError(
+            "scale_params.json is missing '_meta.pipeline_run_id'. "
+            "Re-run features.py to regenerate the file."
+        )
+
     logger.info(f"✅ Scale params loaded from {path}")
+    logger.info(f"   pipeline_run_id = {pipeline_run_id}")
     for col, p in params.items():
         logger.info(f"   {col}: mean={p['mean']}, std={p['std']}")
-    return params
+    return params, pipeline_run_id
 
 
 def scale_value(value: float, col: str, params: dict) -> float:
@@ -90,14 +110,15 @@ def scale_value(value: float, col: str, params: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Model promotion — Ridge preference strategy
+# Model promotion — Ridge preference strategy, scoped to current pipeline run
 # ---------------------------------------------------------------------------
-def promote_best_model() -> tuple[str, dict]:
+def promote_best_model(pipeline_run_id: str) -> tuple[str, dict]:
     """
     Promotion strategy:
 
-    1. Find the best overall run by test_r2 (any model type).
-    2. Find the best Ridge run by test_r2.
+    1. Find the best overall run by test_r2 — filtered to this pipeline's
+       runs only via the pipeline_run_id tag.
+    2. Find the best Ridge run by test_r2 — same filter.
     3. If Ridge exists and its test_r2 is within RIDGE_PREFERENCE_TOLERANCE
        of the best overall, promote Ridge.
     4. Otherwise promote the best overall model.
@@ -109,8 +130,13 @@ def promote_best_model() -> tuple[str, dict]:
     - Ridge's L2 penalty shrinks all coefficients toward zero, producing
       stable, biologically meaningful values that won't flip on retrain.
     - A 0.0002 R² difference is noise. Coefficient stability is not.
+
+    FIX 2: The base_filter now includes tags.pipeline_run_id = '<id>' so
+    only runs from the current pipeline execution are considered. This
+    prevents stale runs from previous executions (possibly trained on a
+    different WHO API snapshot) from being accidentally promoted.
     """
-    logger.info("🔍 Searching for best training runs…")
+    logger.info(f"🔍 Searching for best training runs (pipeline_run_id={pipeline_run_id})…")
 
     experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
     if experiment is None:
@@ -118,9 +144,14 @@ def promote_best_model() -> tuple[str, dict]:
             f"Experiment '{EXPERIMENT_NAME}' not found. Run the pipeline first."
         )
 
-    base_filter = "tags.stage = 'training' and tags.status = 'SUCCESS'"
+    # FIX 2: scope to this pipeline's runs only
+    base_filter = (
+        "tags.stage = 'training' "
+        "and tags.status = 'SUCCESS' "
+        f"and tags.pipeline_run_id = '{pipeline_run_id}'"
+    )
 
-    # Best run overall
+    # Best run overall (within this pipeline)
     all_runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
         filter_string=base_filter,
@@ -128,12 +159,15 @@ def promote_best_model() -> tuple[str, dict]:
         max_results=1,
     )
     if not all_runs:
-        raise RuntimeError("No successful training runs found. Run train_model.py first.")
+        raise RuntimeError(
+            f"No successful training runs found for pipeline_run_id='{pipeline_run_id}'. "
+            "Run train_model.py first."
+        )
 
     best_overall = all_runs[0]
     best_test_r2 = best_overall.data.metrics.get("test_r2", float("nan"))
 
-    # Best Ridge run
+    # Best Ridge run (within this pipeline)
     ridge_runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
         filter_string=base_filter + " and tags.model_type = 'Ridge'",
@@ -199,13 +233,14 @@ def promote_best_model() -> tuple[str, dict]:
     logger.info(f"🚀 {model_type} v{version} tagged as Production")
 
     return f"models:/{REGISTERED_MODEL}@Production", {
-        "run_id":      run_id,
-        "version":     version,
-        "model_type":  model_type,
-        "train_r2":    round(train_r2,  4),
-        "test_r2":     round(test_r2,   4),
-        "cv_r2":       round(cv_r2,     4),
-        "test_rmse":   round(test_rmse, 4),
+        "run_id":           run_id,
+        "version":          version,
+        "model_type":       model_type,
+        "pipeline_run_id":  pipeline_run_id,
+        "train_r2":         round(train_r2,  4),
+        "test_r2":          round(test_r2,   4),
+        "cv_r2":            round(cv_r2,     4),
+        "test_rmse":        round(test_rmse, 4),
         "promotion_reason": reason,
     }
 
@@ -225,10 +260,11 @@ async def lifespan(app: FastAPI):
     """Load model and scale params once at startup."""
     logger.info("\n⏳ Starting up — loading model and scale params…")
     try:
-        app_state["scale_params"] = load_scale_params(SCALE_PARAMS_PATH)
-        production_uri, meta      = promote_best_model()
-        app_state["model"]        = mlflow.sklearn.load_model(production_uri)
-        app_state["model_meta"]   = meta
+        scale_params, pipeline_run_id = load_scale_params(SCALE_PARAMS_PATH)
+        app_state["scale_params"]     = scale_params
+        production_uri, meta          = promote_best_model(pipeline_run_id)
+        app_state["model"]            = mlflow.sklearn.load_model(production_uri)
+        app_state["model_meta"]       = meta
         logger.info(f"✅ API ready — serving {meta['model_type']} v{meta['version']}\n")
     except Exception as e:
         logger.error(f"❌ Startup failed: {e}")
@@ -248,7 +284,7 @@ app = FastAPI(
         "Health Observatory data. Ridge Regression preferred when performance "
         "is within tolerance of the best model."
     ),
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 

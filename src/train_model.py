@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -36,6 +37,36 @@ RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
 
 
 # ---------------------------------------------------------------------------
+# Load scale params meta (split_year + pipeline_run_id)
+# ---------------------------------------------------------------------------
+def load_scale_params_meta(path: Path) -> tuple[int, str]:
+    """
+    Read split_year and pipeline_run_id written by features.py.
+
+    FIX 1: Using the split_year from scale_params.json guarantees that
+    train_model.py uses the exact same train/test boundary as features.py,
+    even if post-dropna() row counts differ between the two scripts.
+
+    FIX 2: pipeline_run_id is stamped onto every MLflow training run tag
+    so serve_model.py can filter promotion to only this pipeline's models,
+    preventing stale runs from previous executions from being promoted.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"scale_params.json not found at '{path}'. Run features.py first."
+        )
+    with open(path) as f:
+        data = json.load(f)
+    meta = data.get("_meta", {})
+    split_year      = int(meta["split_year"])
+    pipeline_run_id = str(meta["pipeline_run_id"])
+    print(f"  Read from scale_params.json:")
+    print(f"    split_year      = {split_year}  (authoritative boundary from features.py)")
+    print(f"    pipeline_run_id = {pipeline_run_id}")
+    return split_year, pipeline_run_id
+
+
+# ---------------------------------------------------------------------------
 # Load & split
 # ---------------------------------------------------------------------------
 def load_features(path: Path) -> pd.DataFrame:
@@ -55,21 +86,27 @@ def load_features(path: Path) -> pd.DataFrame:
     return df
 
 
-def split_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame,
-                                           pd.Series,    pd.Series,    int]:
+def split_data(df: pd.DataFrame, split_year: int) -> tuple[pd.DataFrame, pd.DataFrame,
+                                                            pd.Series,    pd.Series,    int]:
     """
-    Chronological train/test split — test set = the most recent 20% of years.
-    Returns X_train, X_test, y_train, y_test, split_year.
+    Chronological train/test split using the authoritative split_year read
+    from scale_params.json (written by features.py).
+
+    FIX 1: Previously this function recomputed split_year independently from
+    features.py using the same 80/20 formula. After dropna() removes NaN
+    lag-warmup rows the total row count is smaller here than in features.py,
+    so int(len * 0.8) could land on a different year — causing the scaler to
+    have been fit on rows that train_model.py placed in the test set.
+    Reading the pre-computed year eliminates that drift entirely.
     """
-    df_sorted  = df.sort_values("year").reset_index(drop=True)
-    split_idx  = int(len(df_sorted) * (1 - TEST_SIZE))
-    split_year = int(df_sorted.iloc[split_idx]["year"])
+    df_sorted = df.sort_values("year").reset_index(drop=True)
 
     X = df_sorted[FEATURE_COLS]
     y = df_sorted[TARGET_COL]
 
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    train_mask = df_sorted["year"] < split_year
+    X_train, X_test = X[train_mask],  X[~train_mask]
+    y_train, y_test = y[train_mask],  y[~train_mask]
 
     print(f"\nTrain/test split (chronological, split at year {split_year}):")
     print(f"  Train: {len(X_train):,} rows  |  Test: {len(X_test):,} rows")
@@ -92,13 +129,14 @@ def compute_metrics(y_true: pd.Series, y_pred: np.ndarray, label: str) -> dict:
 # ---------------------------------------------------------------------------
 def train_and_log(
     model,
-    model_type:   str,
-    run_name:     str,
-    X_train:      pd.DataFrame,
-    X_test:       pd.DataFrame,
-    y_train:      pd.Series,
-    y_test:       pd.Series,
-    extra_params: dict | None = None,
+    model_type:      str,
+    run_name:        str,
+    X_train:         pd.DataFrame,
+    X_test:          pd.DataFrame,
+    y_train:         pd.Series,
+    y_test:          pd.Series,
+    pipeline_run_id: str,
+    extra_params:    dict | None = None,
 ) -> str:
     """
     Fit a model, evaluate it on train / test / CV, log everything to MLflow,
@@ -111,6 +149,9 @@ def train_and_log(
     CV uses TimeSeriesSplit to respect temporal ordering within the training
     set — consistent with the chronological train/test split and prevents
     look-ahead bias inside the cross-validation folds.
+
+    FIX 2: pipeline_run_id is stamped as a tag on every run so
+    serve_model.py can filter to only this pipeline's models during promotion.
     """
     with mlflow.start_run(run_name=run_name) as run:
 
@@ -122,8 +163,8 @@ def train_and_log(
         train_metrics = compute_metrics(y_train, model.predict(X_train), "Train")
         test_metrics  = compute_metrics(y_test,  model.predict(X_test),  "Test")
 
-        # FIX: use TimeSeriesSplit instead of default KFold so CV folds respect
-        # temporal order — prevents look-ahead bias within cross-validation.
+        # TimeSeriesSplit for CV — respects temporal ordering, prevents
+        # look-ahead bias within cross-validation folds.
         tscv = TimeSeriesSplit(n_splits=CV_FOLDS)
 
         cv_r2   = cross_val_score(
@@ -146,53 +187,58 @@ def train_and_log(
         print(f"    intercept: {model.intercept_:+.4f}")
 
         # ── Log params ───────────────────────────────────────────────────────
-        mlflow.log_param("model_type",   model_type)
-        mlflow.log_param("feature_cols", FEATURE_COLS)
-        mlflow.log_param("target_col",   TARGET_COL)
-        mlflow.log_param("test_size",    TEST_SIZE)
-        mlflow.log_param("cv_folds",     CV_FOLDS)
-        mlflow.log_param("cv_strategy",  "TimeSeriesSplit")
-        mlflow.log_param("n_train",      len(X_train))
-        mlflow.log_param("n_test",       len(X_test))
+        mlflow.log_param("model_type",       model_type)
+        mlflow.log_param("feature_cols",     FEATURE_COLS)
+        mlflow.log_param("target_col",       TARGET_COL)
+        mlflow.log_param("test_size",        TEST_SIZE)
+        mlflow.log_param("cv_folds",         CV_FOLDS)
+        mlflow.log_param("cv_strategy",      "TimeSeriesSplit")
+        mlflow.log_param("n_train",          len(X_train))
+        mlflow.log_param("n_test",           len(X_test))
+        mlflow.log_param("pipeline_run_id",  pipeline_run_id)
         if extra_params:
             for k, v in extra_params.items():
                 mlflow.log_param(k, v)
 
         # ── Log metrics ──────────────────────────────────────────────────────
-        mlflow.log_metric("train_r2",     train_metrics["r2"])
-        mlflow.log_metric("train_rmse",   train_metrics["rmse"])
-        mlflow.log_metric("train_mae",    train_metrics["mae"])
-        mlflow.log_metric("test_r2",      test_metrics["r2"])
-        mlflow.log_metric("test_rmse",    test_metrics["rmse"])
-        mlflow.log_metric("test_mae",     test_metrics["mae"])
-        mlflow.log_metric("cv_r2_mean",   cv_r2_mean)
-        mlflow.log_metric("cv_r2_std",    cv_r2_std)
+        mlflow.log_metric("train_r2",    train_metrics["r2"])
+        mlflow.log_metric("train_rmse",  train_metrics["rmse"])
+        mlflow.log_metric("train_mae",   train_metrics["mae"])
+        mlflow.log_metric("test_r2",     test_metrics["r2"])
+        mlflow.log_metric("test_rmse",   test_metrics["rmse"])
+        mlflow.log_metric("test_mae",    test_metrics["mae"])
+        mlflow.log_metric("cv_r2_mean",  cv_r2_mean)
+        mlflow.log_metric("cv_r2_std",   cv_r2_std)
         mlflow.log_metric("cv_rmse_mean", cv_rmse_mean)
 
+        # ── Log coefficients as metrics ───────────────────────────────────────
         for feat, coef in zip(FEATURE_COLS, model.coef_):
-            mlflow.log_metric(f"coef_{feat}", float(coef))
-        mlflow.log_metric("intercept", float(model.intercept_))
+            mlflow.log_metric(f"coef_{feat}", coef)
+        mlflow.log_metric("intercept", model.intercept_)
 
-        # ── Artifacts ────────────────────────────────────────────────────────
-        if SCALE_PARAMS_PATH.exists():
-            mlflow.log_artifact(str(SCALE_PARAMS_PATH))
-        for script in ["cleaning.py", "validate_data.py", "features.py", "train_model.py"]:
-            p = Path(f"src/{script}")
-            if p.exists():
-                mlflow.log_artifact(str(p))
+        # ── Log source scripts as artifacts ───────────────────────────────────
+        for script in ["src/cleaning.py", "src/validate_data.py",
+                       "src/features.py", "src/train_model.py"]:
+            if Path(script).exists():
+                mlflow.log_artifact(script)
 
-        # ── Register ─────────────────────────────────────────────────────────
+        # ── Log model ─────────────────────────────────────────────────────────
         signature = infer_signature(X_train, model.predict(X_train))
         mlflow.sklearn.log_model(
-            sk_model=model,
+            model,
             artifact_path="model",
             signature=signature,
-            registered_model_name="Diabetes_Prevalence_Model",
+            registered_model_name=f"Diabetes_Prevalence_Model",
         )
 
-        mlflow.set_tag("stage",      "training")
-        mlflow.set_tag("status",     "SUCCESS")
-        mlflow.set_tag("model_type", model_type)
+        # ── Tags ──────────────────────────────────────────────────────────────
+        mlflow.set_tag("stage",           "training")
+        mlflow.set_tag("status",          "SUCCESS")
+        mlflow.set_tag("model_type",      model_type)
+        # FIX 2: stamp pipeline_run_id so serve_model.py can scope promotion
+        # to only this pipeline's runs — stale runs from previous executions
+        # (potentially trained on different WHO data) are never promoted.
+        mlflow.set_tag("pipeline_run_id", pipeline_run_id)
 
         print(f"\n  ✅ Logged — Run ID: {run.info.run_id}")
         print(f"     Train R²: {train_metrics['r2']:.4f}  |  "
@@ -205,25 +251,26 @@ def train_and_log(
 # ---------------------------------------------------------------------------
 # Model 1 — Linear Regression (OLS baseline)
 # ---------------------------------------------------------------------------
-def train_linear(X_train, X_test, y_train, y_test) -> str:
+def train_linear(X_train, X_test, y_train, y_test, pipeline_run_id: str) -> str:
     print("\n" + "═" * 55)
     print("  Model 1: Linear Regression (OLS baseline)")
     print("═" * 55)
     return train_and_log(
-        model        = LinearRegression(),
-        model_type   = "LinearRegression",
-        run_name     = "Linear_Regression_Baseline",
-        X_train      = X_train,
-        X_test       = X_test,
-        y_train      = y_train,
-        y_test       = y_test,
+        model            = LinearRegression(),
+        model_type       = "LinearRegression",
+        run_name         = "Linear_Regression_Baseline",
+        X_train          = X_train,
+        X_test           = X_test,
+        y_train          = y_train,
+        y_test           = y_test,
+        pipeline_run_id  = pipeline_run_id,
     )
 
 
 # ---------------------------------------------------------------------------
 # Model 2 — Ridge Regression (L2 regularisation)
 # ---------------------------------------------------------------------------
-def train_ridge(X_train, X_test, y_train, y_test) -> str:
+def train_ridge(X_train, X_test, y_train, y_test, pipeline_run_id: str) -> str:
     """
     Ridge adds an L2 penalty (alpha * ||w||²) to the OLS loss, which
     directly addresses the multicollinearity diagnosed by the VIF analysis
@@ -248,9 +295,6 @@ def train_ridge(X_train, X_test, y_train, y_test) -> str:
     print("  Directly addresses multicollinearity from VIF analysis")
     print("═" * 55)
 
-    # FIX: use TimeSeriesSplit here too — GridSearchCV was previously using
-    # default KFold, which shuffles data and breaks temporal ordering during
-    # alpha search. This makes alpha selection consistent with CV evaluation.
     tscv = TimeSeriesSplit(n_splits=CV_FOLDS)
 
     print(f"\n  Searching alpha values: {RIDGE_ALPHAS}")
@@ -278,14 +322,15 @@ def train_ridge(X_train, X_test, y_train, y_test) -> str:
     print(f"\n  Best alpha: {best_alpha}  (CV R² = {best_cv_score:.4f})")
 
     return train_and_log(
-        model        = gs.best_estimator_,
-        model_type   = "Ridge",
-        run_name     = "Ridge_Regression_L2",
-        X_train      = X_train,
-        X_test       = X_test,
-        y_train      = y_train,
-        y_test       = y_test,
-        extra_params = {
+        model            = gs.best_estimator_,
+        model_type       = "Ridge",
+        run_name         = "Ridge_Regression_L2",
+        X_train          = X_train,
+        X_test           = X_test,
+        y_train          = y_train,
+        y_test           = y_test,
+        pipeline_run_id  = pipeline_run_id,
+        extra_params     = {
             "alpha":              best_alpha,
             "alpha_search_space": str(RIDGE_ALPHAS),
             "alpha_selection":    f"GridSearchCV_{CV_FOLDS}fold_TimeSeriesSplit_r2",
@@ -300,16 +345,20 @@ def run_training_pipeline() -> None:
     mlflow.set_tracking_uri(MLFLOW_TRACKING)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
-    df = load_features(FEATURES_PATH)
-    X_train, X_test, y_train, y_test, split_year = split_data(df)
+    print("\nReading authoritative split boundary from features.py output...")
+    split_year, pipeline_run_id = load_scale_params_meta(SCALE_PARAMS_PATH)
 
-    lr_run_id    = train_linear(X_train, X_test, y_train, y_test)
-    ridge_run_id = train_ridge(X_train,  X_test, y_train, y_test)
+    df = load_features(FEATURES_PATH)
+    X_train, X_test, y_train, y_test, split_year = split_data(df, split_year)
+
+    lr_run_id    = train_linear(X_train, X_test, y_train, y_test, pipeline_run_id)
+    ridge_run_id = train_ridge(X_train,  X_test, y_train, y_test, pipeline_run_id)
 
     print("\n" + "═" * 55)
     print("  Both models logged — MLflow will promote the best")
     print(f"  Linear Regression : {lr_run_id}")
     print(f"  Ridge Regression  : {ridge_run_id}")
+    print(f"  pipeline_run_id   : {pipeline_run_id}")
     print("  Run 'bash run_pipeline.sh' to deploy the winner.")
     print("═" * 55)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import uuid
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -73,7 +74,7 @@ def add_temporal_lags(df: pd.DataFrame, lags: list[int]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Step 4 — Chronological train mask
 # ---------------------------------------------------------------------------
-def get_train_mask(df: pd.DataFrame, test_size: float = TEST_SIZE) -> pd.Series:
+def get_train_mask(df: pd.DataFrame, test_size: float = TEST_SIZE) -> tuple[pd.Series, int]:
     """
     Return a boolean Series that is True for the training rows (oldest 80%)
     and False for the test rows (most recent 20%), using the same chronological
@@ -81,6 +82,11 @@ def get_train_mask(df: pd.DataFrame, test_size: float = TEST_SIZE) -> pd.Series:
 
     This mask is used to compute scale params on training data only —
     preventing test-set statistics from leaking into the scaler.
+
+    Returns (train_mask, split_year). split_year is written into
+    scale_params.json so train_model.py reads the exact same boundary
+    instead of recomputing it independently — fixing the potential 1-year
+    drift caused by differing post-dropna() row counts between the two scripts.
     """
     df_sorted  = df.sort_values("year").reset_index(drop=True)
     split_idx  = int(len(df_sorted) * (1 - test_size))
@@ -95,7 +101,7 @@ def get_train_mask(df: pd.DataFrame, test_size: float = TEST_SIZE) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Standard scaling  (FIX: train-only params, applied to full dataset)
+# Step 5 — Standard scaling  (train-only params, applied to full dataset)
 # ---------------------------------------------------------------------------
 def standard_scale(
     df: pd.DataFrame,
@@ -105,10 +111,8 @@ def standard_scale(
     Z-score scale every feature column using statistics computed on training
     rows only, then apply those same params to the entire dataset.
 
-    FIX: Previously, mean/std were computed on all rows including the test
-    set. This is a mild form of data leakage — the scaler had "seen" future
-    data. Now scale params are fit on train rows only (year < split_year),
-    then applied uniformly, matching how a real production scaler would work.
+    Scale params are fit on train rows only (year < split_year), then applied
+    uniformly, matching how a real production scaler would work.
 
     The saved scale_params.json contains these train-only stats, which
     serve_model.py loads verbatim for inference — preserving training-serving
@@ -143,15 +147,34 @@ def standard_scale(
     return df, params
 
 
-def save_scale_params(params: dict, path: Path) -> None:
+def save_scale_params(params: dict, path: Path, split_year: int, pipeline_run_id: str) -> None:
     """
     Persist scale params as JSON so serve_model.py can load the exact
     training-time values instead of using hardcoded approximations.
+
+    FIX 1 — split_year is now written here so train_model.py reads the
+    authoritative boundary instead of recomputing it independently. This
+    closes the potential 1-year drift caused by differing post-dropna()
+    row counts between features.py and train_model.py.
+
+    FIX 2 — pipeline_run_id is a UUID generated once per pipeline execution
+    and stamped into every MLflow training run tag. serve_model.py reads it
+    here and filters promotion to only the current run's models, preventing
+    stale runs from previous pipeline executions from being promoted.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "_meta": {
+            "split_year":      split_year,
+            "pipeline_run_id": pipeline_run_id,
+        },
+        **params,
+    }
     with open(path, "w") as f:
-        json.dump(params, f, indent=2)
+        json.dump(payload, f, indent=2)
     print(f"\n💾 Scale params saved to {path}")
+    print(f"   split_year      = {split_year}  (authoritative boundary for train_model.py)")
+    print(f"   pipeline_run_id = {pipeline_run_id}  (used by serve_model.py to filter promotion)")
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +259,12 @@ def save_features(df: pd.DataFrame, path: Path) -> None:
 def run_feature_pipeline() -> tuple[pd.DataFrame, dict]:
     print("🚀 Starting feature engineering pipeline...")
 
+    # FIX 2: generate a UUID once here — the same ID will be stamped into
+    # scale_params.json AND into every MLflow training run tag so
+    # serve_model.py can filter promotion to only this pipeline's models.
+    pipeline_run_id = str(uuid.uuid4())
+    print(f"   pipeline_run_id = {pipeline_run_id}")
+
     mlflow.set_tracking_uri(MLFLOW_TRACKING)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
@@ -248,7 +277,7 @@ def run_feature_pipeline() -> tuple[pd.DataFrame, dict]:
         print(f"\nAdding temporal lags: {LAG_YEARS}")
         df = add_temporal_lags(df, LAG_YEARS)
 
-        # FIX: determine train/test boundary before scaling so scale params
+        # Determine train/test boundary before scaling so scale params
         # are fit on training rows only — no test-set leakage into the scaler.
         print("\nDetermining chronological split for leakage-free scaling...")
         train_mask, split_year = get_train_mask(df, TEST_SIZE)
@@ -256,8 +285,10 @@ def run_feature_pipeline() -> tuple[pd.DataFrame, dict]:
         print("\nScaling features to N(0,1) using training statistics only...")
         df, scale_params = standard_scale(df, train_mask)
 
-        # ── Persist scale params ─────────────────────────────────────────────
-        save_scale_params(scale_params, SCALE_PARAMS_PATH)
+        # FIX 1 + 2: persist split_year and pipeline_run_id into the JSON so
+        # downstream scripts read the authoritative values instead of
+        # recomputing them independently.
+        save_scale_params(scale_params, SCALE_PARAMS_PATH, split_year, pipeline_run_id)
 
         # ── EDA ─────────────────────────────────────────────────────────────
         eda_metrics = compute_eda_metrics(df)
@@ -275,6 +306,7 @@ def run_feature_pipeline() -> tuple[pd.DataFrame, dict]:
         mlflow.log_param("scale_fit_on",       "train_rows_only")
         mlflow.log_param("scale_split_year",   split_year)
         mlflow.log_param("test_size",          TEST_SIZE)
+        mlflow.log_param("pipeline_run_id",    pipeline_run_id)
 
         # Log scale params so every run's exact scalers are in MLflow
         for col, p in scale_params.items():
@@ -288,8 +320,9 @@ def run_feature_pipeline() -> tuple[pd.DataFrame, dict]:
         # Log the scale params JSON as an artifact for full reproducibility
         mlflow.log_artifact(str(SCALE_PARAMS_PATH))
 
-        mlflow.set_tag("stage",  "feature_engineering")
-        mlflow.set_tag("status", "SUCCESS")
+        mlflow.set_tag("stage",           "feature_engineering")
+        mlflow.set_tag("status",          "SUCCESS")
+        mlflow.set_tag("pipeline_run_id", pipeline_run_id)
 
         print(f"\n   MLflow run: {run.info.run_id}")
         print("🏁 Feature pipeline complete.\n")
