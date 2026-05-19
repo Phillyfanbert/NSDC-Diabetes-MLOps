@@ -1,4 +1,3 @@
-```markdown
 # NSDC Diabetes MLOps Pipeline
 
 An end-to-end MLOps pipeline that predicts global diabetes prevalence using historical obesity trends from the WHO Global Health Observatory (GHO) API. Built by the NSDC Spring Quarter team as a demonstration of production machine learning practices: live data ingestion, automated validation, experiment tracking, model registry, and REST API serving.
