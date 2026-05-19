@@ -4,7 +4,7 @@ import pandas as pd
 from pathlib import Path
 
 from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.model_selection import cross_val_score, GridSearchCV
+from sklearn.model_selection import cross_val_score, GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 
 import mlflow
@@ -107,6 +107,10 @@ def train_and_log(
     Because serve_model.py promotes by test_r2 DESC, whichever model scores
     higher on the held-out test set automatically becomes Production — no
     manual intervention needed.
+
+    CV uses TimeSeriesSplit to respect temporal ordering within the training
+    set — consistent with the chronological train/test split and prevents
+    look-ahead bias inside the cross-validation folds.
     """
     with mlflow.start_run(run_name=run_name) as run:
 
@@ -118,17 +122,21 @@ def train_and_log(
         train_metrics = compute_metrics(y_train, model.predict(X_train), "Train")
         test_metrics  = compute_metrics(y_test,  model.predict(X_test),  "Test")
 
+        # FIX: use TimeSeriesSplit instead of default KFold so CV folds respect
+        # temporal order — prevents look-ahead bias within cross-validation.
+        tscv = TimeSeriesSplit(n_splits=CV_FOLDS)
+
         cv_r2   = cross_val_score(
-            model, X_train, y_train, cv=CV_FOLDS, scoring="r2"
+            model, X_train, y_train, cv=tscv, scoring="r2"
         )
         cv_rmse = np.sqrt(-cross_val_score(
-            model, X_train, y_train, cv=CV_FOLDS,
+            model, X_train, y_train, cv=tscv,
             scoring="neg_mean_squared_error",
         ))
         cv_r2_mean   = float(cv_r2.mean())
         cv_r2_std    = float(cv_r2.std())
         cv_rmse_mean = float(cv_rmse.mean())
-        print(f"  CV ({CV_FOLDS}-fold)  — R²: {cv_r2_mean:.4f} ± {cv_r2_std:.4f}"
+        print(f"  CV ({CV_FOLDS}-fold, temporal)  — R²: {cv_r2_mean:.4f} ± {cv_r2_std:.4f}"
               f"  |  RMSE: {cv_rmse_mean:.4f}")
 
         # ── Coefficients ─────────────────────────────────────────────────────
@@ -143,6 +151,7 @@ def train_and_log(
         mlflow.log_param("target_col",   TARGET_COL)
         mlflow.log_param("test_size",    TEST_SIZE)
         mlflow.log_param("cv_folds",     CV_FOLDS)
+        mlflow.log_param("cv_strategy",  "TimeSeriesSplit")
         mlflow.log_param("n_train",      len(X_train))
         mlflow.log_param("n_test",       len(X_test))
         if extra_params:
@@ -228,20 +237,27 @@ def train_ridge(X_train, X_test, y_train, y_test) -> str:
       any of them, preserving interpretability while stabilising coefficients.
 
     Alpha tuning:
-      GridSearchCV finds the alpha that maximises CV R² on the training set.
-      The search range spans four orders of magnitude to avoid missing the
-      optimal value. The best alpha is logged to MLflow as a parameter.
+      GridSearchCV uses TimeSeriesSplit (consistent with train_and_log) to
+      find the alpha that maximises CV R² on the training set without
+      introducing look-ahead bias. The search range spans four orders of
+      magnitude to avoid missing the optimal value. The best alpha is logged
+      to MLflow as a parameter.
     """
     print("\n" + "═" * 55)
     print("  Model 2: Ridge Regression (L2 regularisation)")
     print("  Directly addresses multicollinearity from VIF analysis")
     print("═" * 55)
 
+    # FIX: use TimeSeriesSplit here too — GridSearchCV was previously using
+    # default KFold, which shuffles data and breaks temporal ordering during
+    # alpha search. This makes alpha selection consistent with CV evaluation.
+    tscv = TimeSeriesSplit(n_splits=CV_FOLDS)
+
     print(f"\n  Searching alpha values: {RIDGE_ALPHAS}")
     gs = GridSearchCV(
         Ridge(),
         param_grid = {"alpha": RIDGE_ALPHAS},
-        cv         = CV_FOLDS,
+        cv         = tscv,
         scoring    = "r2",
         refit      = True,
     )
@@ -250,7 +266,7 @@ def train_ridge(X_train, X_test, y_train, y_test) -> str:
     best_alpha    = gs.best_params_["alpha"]
     best_cv_score = gs.best_score_
 
-    print(f"\n  Alpha search results:")
+    print(f"\n  Alpha search results (TimeSeriesSplit CV):")
     for alpha, mean_s, std_s in zip(
         RIDGE_ALPHAS,
         gs.cv_results_["mean_test_score"],
@@ -272,7 +288,7 @@ def train_ridge(X_train, X_test, y_train, y_test) -> str:
         extra_params = {
             "alpha":              best_alpha,
             "alpha_search_space": str(RIDGE_ALPHAS),
-            "alpha_selection":    f"GridSearchCV_{CV_FOLDS}fold_r2",
+            "alpha_selection":    f"GridSearchCV_{CV_FOLDS}fold_TimeSeriesSplit_r2",
         },
     )
 

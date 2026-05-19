@@ -11,12 +11,15 @@ import mlflow
 # ---------------------------------------------------------------------------
 CLEAN_DATA_PATH    = Path("data/clean/diabetes_obesity_clean.parquet")
 FEATURES_DATA_PATH = Path("data/processed/features.parquet")
-SCALE_PARAMS_PATH  = Path("data/processed/scale_params.json")   # ← NEW: persisted scalers
+SCALE_PARAMS_PATH  = Path("data/processed/scale_params.json")
 MLFLOW_TRACKING    = "http://127.0.0.1:5000"
 EXPERIMENT_NAME    = "NSDC_Diabetes_Project"
 
 # Lag windows — changing this list is the only thing needed to try new windows
 LAG_YEARS = [1, 2, 3]
+
+# Must match TEST_SIZE in train_model.py so the split year is identical
+TEST_SIZE = 0.20
 
 CORE_COLS = ["country_code", "year", "target_diabetes", "feature_obesity"]
 
@@ -68,36 +71,74 @@ def add_temporal_lags(df: pd.DataFrame, lags: list[int]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Standard scaling  ← KEY FIX: params are now saved to disk
+# Step 4 — Chronological train mask
 # ---------------------------------------------------------------------------
-def standard_scale(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def get_train_mask(df: pd.DataFrame, test_size: float = TEST_SIZE) -> pd.Series:
     """
-    Z-score scale every feature and target column.
+    Return a boolean Series that is True for the training rows (oldest 80%)
+    and False for the test rows (most recent 20%), using the same chronological
+    split logic as train_model.py.
 
-    Scale params (mean + std) are computed on the FULL dataset here and
-    returned for persistence to disk. serve_model.py must load these same
-    params at inference time — this eliminates the hardcoded approximations
-    that were previously baked into the API.
+    This mask is used to compute scale params on training data only —
+    preventing test-set statistics from leaking into the scaler.
+    """
+    df_sorted  = df.sort_values("year").reset_index(drop=True)
+    split_idx  = int(len(df_sorted) * (1 - test_size))
+    split_year = int(df_sorted.iloc[split_idx]["year"])
+
+    train_mask = df["year"] < split_year
+    n_train = int(train_mask.sum())
+    n_test  = int((~train_mask).sum())
+    print(f"\n  Scale params will be fit on training rows only (year < {split_year})")
+    print(f"  Train rows: {n_train:,}  |  Test rows (held out of scaler): {n_test:,}")
+    return train_mask, split_year
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Standard scaling  (FIX: train-only params, applied to full dataset)
+# ---------------------------------------------------------------------------
+def standard_scale(
+    df: pd.DataFrame,
+    train_mask: pd.Series,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Z-score scale every feature column using statistics computed on training
+    rows only, then apply those same params to the entire dataset.
+
+    FIX: Previously, mean/std were computed on all rows including the test
+    set. This is a mild form of data leakage — the scaler had "seen" future
+    data. Now scale params are fit on train rows only (year < split_year),
+    then applied uniformly, matching how a real production scaler would work.
+
+    The saved scale_params.json contains these train-only stats, which
+    serve_model.py loads verbatim for inference — preserving training-serving
+    parity without any approximation.
+
+    Note: target_diabetes is NOT scaled here. train_model.py predicts the
+    raw percentage directly, so scaling the target would require inverse-
+    transforming every prediction. Keeping it unscaled keeps inference simple.
     """
     scale_cols = (
-        ["feature_obesity", "target_diabetes"]
-        + [c for c in df.columns if c.startswith("obesity_lag_")]
+        ["feature_obesity"]
+        + [c for c in df.columns if c.startswith("obesity_lag_") and "_scaled" not in c]
     )
 
     params = {}
     df = df.copy()
 
     for col in scale_cols:
-        mu  = df[col].mean()
-        std = df[col].std(ddof=0)
+        train_vals = df.loc[train_mask, col].dropna()
+
+        mu  = float(train_vals.mean())
+        std = float(train_vals.std(ddof=0))
 
         if std == 0 or np.isnan(std):
-            print(f"  ⚠️  Skipping '{col}' — zero variance, cannot scale")
+            print(f"  ⚠️  Skipping '{col}' — zero variance on training rows, cannot scale")
             continue
 
         df[f"{col}_scaled"] = (df[col] - mu) / std
-        params[col] = {"mean": round(float(mu), 6), "std": round(float(std), 6)}
-        print(f"  {col}: mean={params[col]['mean']}, std={params[col]['std']}")
+        params[col] = {"mean": round(mu, 6), "std": round(std, 6)}
+        print(f"  {col}: mean={params[col]['mean']}, std={params[col]['std']}  (train rows only)")
 
     return df, params
 
@@ -114,7 +155,7 @@ def save_scale_params(params: dict, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — EDA metrics (logged to MLflow, not just printed)
+# Step 6 — EDA metrics (logged to MLflow, not just printed)
 # ---------------------------------------------------------------------------
 def compute_eda_metrics(df: pd.DataFrame) -> dict:
     """
@@ -181,7 +222,7 @@ def print_eda_summary(df: pd.DataFrame, metrics: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — Save feature parquet
+# Step 7 — Save feature parquet
 # ---------------------------------------------------------------------------
 def save_features(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,8 +248,13 @@ def run_feature_pipeline() -> tuple[pd.DataFrame, dict]:
         print(f"\nAdding temporal lags: {LAG_YEARS}")
         df = add_temporal_lags(df, LAG_YEARS)
 
-        print("\nScaling features to N(0,1)...")
-        df, scale_params = standard_scale(df)
+        # FIX: determine train/test boundary before scaling so scale params
+        # are fit on training rows only — no test-set leakage into the scaler.
+        print("\nDetermining chronological split for leakage-free scaling...")
+        train_mask, split_year = get_train_mask(df, TEST_SIZE)
+
+        print("\nScaling features to N(0,1) using training statistics only...")
+        df, scale_params = standard_scale(df, train_mask)
 
         # ── Persist scale params ─────────────────────────────────────────────
         save_scale_params(scale_params, SCALE_PARAMS_PATH)
@@ -226,6 +272,9 @@ def run_feature_pipeline() -> tuple[pd.DataFrame, dict]:
         mlflow.log_param("features_path",      str(FEATURES_DATA_PATH))
         mlflow.log_param("scale_params_path",  str(SCALE_PARAMS_PATH))
         mlflow.log_param("scaled_columns",     list(scale_params.keys()))
+        mlflow.log_param("scale_fit_on",       "train_rows_only")
+        mlflow.log_param("scale_split_year",   split_year)
+        mlflow.log_param("test_size",          TEST_SIZE)
 
         # Log scale params so every run's exact scalers are in MLflow
         for col, p in scale_params.items():
