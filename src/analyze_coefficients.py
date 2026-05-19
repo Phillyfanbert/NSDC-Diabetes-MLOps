@@ -85,10 +85,10 @@ def plot_coefficients(df: pd.DataFrame, metrics: dict, run_id: str) -> None:
                    linewidth=0.5, height=0.55)
 
     for bar, val in zip(bars, df["coefficient"]):
-        x_pos = val + (0.5 if val >= 0 else -0.5)
-        ha    = "left" if val >= 0 else "right"
+        # Always place label to the right of the zero line, inside the axes
+        x_pos = abs(val) + 0.05
         ax.text(x_pos, bar.get_y() + bar.get_height() / 2,
-                f"{val:+.2f}", va="center", ha=ha, fontsize=10)
+                f"{val:+.2f}", va="center", ha="left", fontsize=10)
 
     model_type = metrics.get("model_type", "Unknown")          # ← DYNAMIC
     ax.axvline(0, color="black", linewidth=0.8)
@@ -108,6 +108,9 @@ def plot_coefficients(df: pd.DataFrame, metrics: dict, run_id: str) -> None:
     ]
     ax.legend(handles=legend_elements, fontsize=9, loc="lower right")
     ax.grid(axis="x", alpha=0.25)
+    # Extend x-axis right margin so labels are never clipped
+    x_max = df["abs_coef"].max()
+    ax.set_xlim(left=-(x_max * 0.35), right=x_max * 1.25)
     plt.tight_layout()
     plt.savefig(OUTPUT_PATH, dpi=150, bbox_inches="tight")
     plt.show()

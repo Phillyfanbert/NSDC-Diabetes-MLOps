@@ -67,6 +67,22 @@ DROP_COLS = [
     "DataSourceDimType",
     "DataSourceDim",
     "Comments",
+    # --- ParentLocation code duplicates (keep ParentLocation label, drop code) ---
+    "ParentLocationCode_diabetes",
+    "ParentLocationCode_obesity",
+    # --- Dim1Type duplicates (sex dimension type, redundant after filtering) ---
+    "Dim1Type_diabetes",
+    "Dim1Type_obesity",
+    # --- Dim2 / Dim2Type (unused secondary dimension from WHO API) ---
+    "Dim2_diabetes",
+    "Dim2_obesity",
+    "Dim2Type_diabetes",
+    "Dim2Type_obesity",
+    # --- Dim3 / Dim3Type (unused tertiary dimension from WHO API) ---
+    "Dim3_diabetes",
+    "Dim3_obesity",
+    "Dim3Type_diabetes",
+    "Dim3Type_obesity",
     # --- Duplicate join-remnant identifiers added by pd.merge suffixes ---
     # fetch_data.py merges with suffixes=("_diabetes", "_obesity"),
     # producing *_diabetes / *_obesity pairs for shared columns.
