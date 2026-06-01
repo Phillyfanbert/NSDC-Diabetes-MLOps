@@ -73,7 +73,7 @@ When you run `bash run_pipeline.sh`, here is what happens:
 | 1 | `run_pipeline.sh` | Creates the logs directory and starts the MLflow UI in the background |
 | 2 | `src/fetch_data.py` | Fetches live diabetes and obesity data from the WHO GHO API and saves a joined Parquet file |
 | 3 | `src/cleaning.py` | Drops ~36 metadata columns, converts strings to floats, saves a clean Parquet file |
-| 4 | `src/validate_data.py` | Enforces the data contract — halts the pipeline if any check fails |
+| 4 | `src/validate_data.py` | Enforces the data contract, halts the pipeline if any check fails |
 | 5 | `src/features.py` | Replaces collinear lag features with obesity level (current %) + 3yr trend slope (pp/yr); Z-score scales both; saves `scale_params.json`. This reduced VIF from > 1,000,000 to 1.41 |
 | 6 | `src/train_model.py` | Trains Linear Regression and Ridge Regression; logs all metrics and artifacts to MLflow |
 | 7 | `src/serve_model.py` | Promotes the best model to Production; starts the FastAPI prediction server |
@@ -84,7 +84,7 @@ When you run `bash run_pipeline.sh`, here is what happens:
 
 ## Viewing Results
 
-### MLflow UI — experiment tracking
+### MLflow UI: experiment tracking
 
 Once the pipeline is running, open the MLflow dashboard to inspect every experiment run, compare model metrics, and view logged artifacts (charts, source scripts, scale parameters):
 
@@ -190,7 +190,7 @@ NSDC-Diabetes-MLOps/
 Ridge coefficients: **+3.41** for obesity level (higher absolute obesity → higher diabetes risk), **−0.52** for obesity trend. The negative trend coefficient reflects a real pattern: countries with rapidly rising obesity tend to be earlier in their epidemic with lower diagnostic rates, while high-but-stable obesity nations have mature healthcare systems that detect more cases.
 
 ### Where the model is most wrong (and why that's informative)
-The outlier detective analysis (`src/outlier_detective.py`) surfaces systematic gaps — countries where obesity alone cannot explain diabetes rates:
+The outlier detective analysis (`src/outlier_detective.py`) surfaces systematic gaps, countries where obesity alone cannot explain diabetes rates:
 
 | Country | Residual | Interpretation |
 |---------|----------|----------------|
@@ -200,7 +200,7 @@ The outlier detective analysis (`src/outlier_detective.py`) surfaces systematic 
 | USA | −4.87 pp | High-income country: better metabolic health management, earlier intervention, different obesity subtypes |
 | Germany | −4.30 pp | Same pattern |
 
-These are not model failures — they are signals that obesity is a strong but incomplete predictor and that region-specific confounders (genetics, diet composition, healthcare access) matter.
+These are not model failures, they are signals that obesity is a strong but incomplete predictor and that region-specific confounders (genetics, diet composition, healthcare access) matter.
 
 ### Lag optimizer experiment
 We tested whether longer lag windows (5, 7, 10 years) would improve accuracy over the default 1/2/3yr lags. Result: R² decreased from 0.6989 → 0.6932 and RMSE increased from 2.1737 → 2.2855. Shorter lags were retained.
@@ -211,7 +211,7 @@ We tested whether longer lag windows (5, 7, 10 years) would improve accuracy ove
 
 | Decision | Why |
 |----------|-----|
-| **Live WHO API instead of static CSV** | Static CSVs go stale. A live API means the pipeline always uses current WHO data and demonstrates real MLOps — the system can retrain on new data automatically |
+| **Live WHO API instead of static CSV** | Static CSVs go stale. A live API means the pipeline always uses current WHO data and demonstrates real MLOps, the system can retrain on new data automatically |
 | **Level + trend features instead of raw lags** | Raw 1/2/3yr lag features had VIF > 1,000,000 (r ≈ 0.9999 pairwise), making coefficients unstable. Replacing them with obesity level (current %) and 3yr trend slope reduced VIF to 1.41 and correlation to r = 0.54 |
 | **Ridge over Lasso** | Lasso (L1) pushes coefficients to exactly zero, which would silently drop lag-like features. Ridge (L2) shrinks all coefficients together without elimination, preserving interpretability while stabilising them |
 | **Inner join on country + year** | An outer join would introduce NaN rows requiring imputation assumptions. Inner join keeps only rows with paired, verified measurements |
@@ -271,7 +271,7 @@ The pipeline generates these artifacts automatically (excluded from the repo by 
 |--------|--------|-------------|
 | `coefficient_plot.png` | `analyze_coefficients.py` | Ridge feature coefficients (+3.41 level, −0.52 trend) |
 | `multicollinearity_heatmap.png` | `multicollinearity_analysis.py` | Pairwise correlation between features (r = 0.54 after fix) |
-| `vif_scores.png` | `multicollinearity_analysis.py` | VIF per feature (1.41 for both — well below threshold) |
+| `vif_scores.png` | `multicollinearity_analysis.py` | VIF per feature (1.41 for both, well below threshold) |
 | `predicted_vs_actual.png` | `visualize_errors.py` | Scatter plot of model predictions vs. ground truth |
 | `outlier_detective_plot.png` | `outlier_detective.py` | Top-10 countries with highest residuals |
 | `top10_residuals.csv` | `outlier_detective.py` | Ranked residual table with country, region, mean residual |
