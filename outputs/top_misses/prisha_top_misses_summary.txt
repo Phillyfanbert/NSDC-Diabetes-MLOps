@@ -1,0 +1,28 @@
+Prisha Week 6 Summary - Top 10 Misses
+
+Task:
+Identify the country-year rows where the model is most wrong using residuals.
+
+Residual definition:
+Residual = Actual - Predicted
+
+Interpretation:
+- Positive residual = the model underpredicted diabetes
+- Negative residual = the model overpredicted diabetes
+- Large absolute residual = the model was very wrong
+
+Key Findings:
+- The model’s largest underpredictions occur mostly in Palau across multiple years, suggesting that diabetes prevalence there is consistently higher 
+than the model expects from obesity-based features alone.
+- The model’s largest overpredictions occur mostly in the United States and Canada across multiple years, 
+suggesting that obesity-based features may overestimate diabetes prevalence in those countries.
+- These repeated multi-year patterns suggest persistent country-level or region-level effects rather
+ than random one-year noise.
+- Overall, the residual analysis shows that obesity is a useful predictor, but not 
+sufficient by itself to explain diabetes prevalence across all countries.
+
+Why this matters:
+- Big misses may suggest hidden confounders beyond obesity alone
+- Misses clustered in one region may suggest geography-specific drivers
+- Underpredicted rows mean diabetes is higher than the model expected
+- Overpredicted rows mean diabetes is lower than the model expected
